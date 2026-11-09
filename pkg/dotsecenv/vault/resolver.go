@@ -1,0 +1,543 @@
+package vault
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"os"
+	"strings"
+	"sync"
+)
+
+// VaultResolver manages multiple vault files
+type VaultResolver struct {
+	vaults     []*Manager // 0-indexed list of managers, nil if failed to load
+	loadErrors map[int]error
+	config     VaultConfig
+	mu         sync.RWMutex
+}
+
+// NewVaultResolver creates a new vault resolver from configuration
+func NewVaultResolver(config VaultConfig) *VaultResolver {
+	return &VaultResolver{
+		vaults:     make([]*Manager, len(config.Entries)),
+		loadErrors: make(map[int]error),
+		config:     config,
+	}
+}
+
+// OpenVaults opens all vault files in the configuration
+// Returns error if no vaults could be opened
+func (vr *VaultResolver) OpenVaults(stderr io.Writer) error {
+	vr.mu.Lock()
+	defer vr.mu.Unlock()
+
+	if len(vr.config.Entries) == 0 {
+		return fmt.Errorf("no vaults configured")
+	}
+
+	var vaultsOpened int
+	var errors []string
+
+	for i, entry := range vr.config.Entries {
+		// First check if the vault file exists and is not empty
+		fileInfo, err := os.Stat(entry.Path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				// Silent skip for missing files - expected in some workflows
+				vr.loadErrors[i] = fmt.Errorf("no such file or directory: %w", os.ErrNotExist)
+				continue
+			}
+			// Warn for other stat errors (permission denied, etc.)
+			errmsg := fmt.Sprintf("vault '%s': %v", entry.Path, err)
+			vr.loadErrors[i] = err
+			errors = append(errors, errmsg)
+			if stderr != nil {
+				_, _ = fmt.Fprintf(stderr, "warning: %s\n", errmsg)
+			}
+			continue
+		}
+
+		// Check if file is empty (not a valid vault)
+		if fileInfo.Size() == 0 {
+			errmsg := fmt.Sprintf("vault '%s': file is empty (invalid vault structure)", entry.Path)
+			vr.loadErrors[i] = fmt.Errorf("file is empty (invalid vault structure)")
+			errors = append(errors, errmsg)
+			if stderr != nil {
+				_, _ = fmt.Fprintf(stderr, "warning: %s\n", errmsg)
+			}
+			continue
+		}
+
+		manager := NewManager(entry.Path, vr.config.RequireExplicitVaultUpgrade)
+
+		// Try to open the vault
+		if err := manager.OpenAndLock(); err != nil {
+			errmsg := fmt.Sprintf("vault '%s': %v", entry.Path, err)
+			vr.loadErrors[i] = err
+			errors = append(errors, errmsg)
+
+			if stderr != nil {
+				_, _ = fmt.Fprintf(stderr, "warning: %s\n", errmsg)
+			}
+			continue
+		}
+
+		// Successfully opened this vault
+		vr.vaults[i] = manager
+		vaultsOpened++
+	}
+
+	// If no vaults were successfully opened, return error
+	if vaultsOpened == 0 {
+		if len(errors) > 0 {
+			return fmt.Errorf("no vault files could be opened:\n  - %s", strings.Join(errors, "\n  - "))
+		}
+		return fmt.Errorf("no vault files could be opened from configuration")
+	}
+
+	return nil
+}
+
+// OpenVaultsFromPaths opens vaults from explicit -v command-line paths
+// Replaces the current configuration with these paths
+func (vr *VaultResolver) OpenVaultsFromPaths(paths []string, stderr io.Writer) error {
+	vr.mu.Lock()
+	defer vr.mu.Unlock()
+
+	if len(paths) == 0 {
+		return fmt.Errorf("no vault paths specified")
+	}
+
+	// Update config (preserve RequireExplicitVaultUpgrade setting)
+	requireExplicitUpgrade := vr.config.RequireExplicitVaultUpgrade
+	vr.config = VaultConfig{
+		RequireExplicitVaultUpgrade: requireExplicitUpgrade,
+	}
+	for _, path := range paths {
+		vr.config.Entries = append(vr.config.Entries, VaultEntry{Path: ExpandPath(path)})
+	}
+
+	// Reset state
+	vr.vaults = make([]*Manager, len(vr.config.Entries))
+	vr.loadErrors = make(map[int]error)
+
+	// Open vaults
+	for i, entry := range vr.config.Entries {
+		if _, err := os.Stat(entry.Path); err != nil {
+			if os.IsNotExist(err) {
+				return fmt.Errorf("vault file not found: %s", entry.Path)
+			}
+			if os.IsPermission(err) {
+				return fmt.Errorf("vault file permission denied: %s\nCheck file permissions or run with appropriate privileges", entry.Path)
+			}
+			return fmt.Errorf("cannot access vault file: %s: %v", entry.Path, err)
+		}
+
+		manager := NewManager(entry.Path, vr.config.RequireExplicitVaultUpgrade)
+		if err := manager.OpenAndLock(); err != nil {
+			// Use errors.Is to detect wrapped permission errors
+			if errors.Is(err, fs.ErrPermission) {
+				return fmt.Errorf("vault file permission denied: %s\nCheck file permissions or run with appropriate privileges", entry.Path)
+			}
+			return fmt.Errorf("failed to open vault %s: %v", entry.Path, err)
+		}
+
+		vr.vaults[i] = manager
+	}
+
+	return nil
+}
+
+// GetLoadError returns the error encountered when loading a vault at index
+func (vr *VaultResolver) GetLoadError(index int) error {
+	vr.mu.RLock()
+	defer vr.mu.RUnlock()
+	return vr.loadErrors[index]
+}
+
+// GetSecretFromAnyVault returns the latest value of a secret from the first
+// vault, in configuration order, where the secret exists and is not deleted,
+// together with that vault's index.
+func (vr *VaultResolver) GetSecretFromAnyVault(key string, stderr io.Writer) (*SecretValue, int, error) {
+	vr.mu.RLock()
+	defer vr.mu.RUnlock()
+
+	// Normalize key for lookup (graceful fallback for legacy keys)
+	key = NormalizeKeyForLookup(key)
+
+	for i, manager := range vr.vaults {
+		if manager == nil {
+			continue
+		}
+
+		secret := manager.GetSecretByKey(key)
+		if secret != nil && len(secret.Values) > 0 && !secret.IsDeleted() {
+			return &secret.Values[len(secret.Values)-1], i, nil
+		}
+	}
+
+	return nil, -1, fmt.Errorf("secret '%s' not found in any vault", key)
+}
+
+// GetAccessibleSecretFromAnyVault returns the most recent live value encrypted
+// to the identity from the first vault, in configuration order, that has one,
+// together with that vault's index. Within a vault it falls back to older live
+// values when the identity is not on the latest one.
+func (vr *VaultResolver) GetAccessibleSecretFromAnyVault(key, fingerprint string) (*SecretValue, int, error) {
+	vr.mu.RLock()
+	defer vr.mu.RUnlock()
+
+	// Normalize key for lookup (graceful fallback for legacy keys)
+	key = NormalizeKeyForLookup(key)
+
+	for i, manager := range vr.vaults {
+		if manager == nil {
+			continue
+		}
+
+		val := manager.GetAccessibleSecretValue(fingerprint, key)
+		if val != nil {
+			return val, i, nil
+		}
+	}
+
+	return nil, -1, fmt.Errorf("secret '%s' not found or not accessible in any vault", key)
+}
+
+// AddIdentity adds an identity to all open vaults (or a specific vault if index >= 0)
+func (vr *VaultResolver) AddIdentity(identity Identity, index int) error {
+	vr.mu.Lock()
+	defer vr.mu.Unlock()
+
+	if index >= 0 {
+		if index >= len(vr.vaults) {
+			return fmt.Errorf("vault index %d out of range", index)
+		}
+		manager := vr.vaults[index]
+		if manager == nil {
+			if loadErr := vr.loadErrors[index]; loadErr != nil {
+				return loadErr
+			}
+			return fmt.Errorf("vault not loaded")
+		}
+		if manager.IsReadOnly() {
+			return fmt.Errorf("is read-only")
+		}
+		manager.AddIdentity(identity)
+		return nil
+	}
+
+	// Add to all writable vaults
+	for _, manager := range vr.vaults {
+		if manager != nil && !manager.IsReadOnly() {
+			manager.AddIdentity(identity)
+		}
+	}
+	return nil
+}
+
+// AddSecret adds a secret to a specific vault index (0-based)
+func (vr *VaultResolver) AddSecret(secret Secret, index int) error {
+	vr.mu.Lock()
+	defer vr.mu.Unlock()
+
+	if index < 0 || index >= len(vr.vaults) {
+		return fmt.Errorf("vault index %d out of range", index)
+	}
+
+	manager := vr.vaults[index]
+	if manager == nil {
+		if loadErr := vr.loadErrors[index]; loadErr != nil {
+			return loadErr
+		}
+		return fmt.Errorf("vault not loaded")
+	}
+	if manager.IsReadOnly() {
+		return fmt.Errorf("is read-only")
+	}
+
+	manager.AddSecret(secret)
+	return nil
+}
+
+// GetIdentityByFingerprint finds an identity by fingerprint in any vault
+func (vr *VaultResolver) GetIdentityByFingerprint(fingerprint string) *Identity {
+	vr.mu.RLock()
+	defer vr.mu.RUnlock()
+
+	for _, manager := range vr.vaults {
+		if manager != nil {
+			identity := manager.GetIdentityByFingerprint(fingerprint)
+			if identity != nil {
+				return identity
+			}
+		}
+	}
+	return nil
+}
+
+// SaveAll saves all open vaults
+func (vr *VaultResolver) SaveAll() error {
+	vr.mu.Lock()
+	defer vr.mu.Unlock()
+
+	for i, manager := range vr.vaults {
+		if manager == nil || manager.IsReadOnly() {
+			continue
+		}
+		if err := manager.Save(); err != nil {
+			return fmt.Errorf("failed to save vault %d: %w", i+1, err)
+		}
+	}
+	return nil
+}
+
+// CloseAll closes all open vaults
+func (vr *VaultResolver) CloseAll() error {
+	vr.mu.Lock()
+	defer vr.mu.Unlock()
+
+	var lastErr error
+	for i, manager := range vr.vaults {
+		if manager == nil {
+			continue
+		}
+		if err := manager.Unlock(); err != nil {
+			lastErr = fmt.Errorf("failed to close vault %d: %w", i+1, err)
+		}
+	}
+	return lastErr
+}
+
+// GetConfig returns the vault configuration
+func (vr *VaultResolver) GetConfig() VaultConfig {
+	return vr.config
+}
+
+// GetVaultManager returns the vault manager for a specific index
+func (vr *VaultResolver) GetVaultManager(index int) *Manager {
+	vr.mu.RLock()
+	defer vr.mu.RUnlock()
+
+	if index < 0 || index >= len(vr.vaults) {
+		return nil
+	}
+	return vr.vaults[index]
+}
+
+// GetSecretByKeyFromVault gets a secret by key from a specific vault index
+// Used for operations that need to modify a secret in place
+func (vr *VaultResolver) GetSecretByKeyFromVault(index int, key string) *Secret {
+	vr.mu.RLock()
+	defer vr.mu.RUnlock()
+
+	// Normalize key for lookup (graceful fallback for legacy keys)
+	key = NormalizeKeyForLookup(key)
+
+	if index < 0 || index >= len(vr.vaults) {
+		return nil
+	}
+	manager := vr.vaults[index]
+	if manager == nil {
+		return nil
+	}
+
+	return manager.GetSecretByKey(key)
+}
+
+// GetVaultPaths returns all vault paths in configuration order
+func (vr *VaultResolver) GetVaultPaths() []string {
+	var paths []string
+	for _, entry := range vr.config.Entries {
+		paths = append(paths, entry.Path)
+	}
+	return paths
+}
+
+// VaultPathWithIndex pairs a vault path with its original configuration index
+type VaultPathWithIndex struct {
+	Path  string
+	Index int
+}
+
+// GetAvailableVaultPathsWithIndices returns only vault paths that were successfully loaded,
+// paired with their original configuration indices. This is useful for interactive selection
+// where we need to map the selected item back to the correct vault index.
+func (vr *VaultResolver) GetAvailableVaultPathsWithIndices() []VaultPathWithIndex {
+	vr.mu.RLock()
+	defer vr.mu.RUnlock()
+
+	var result []VaultPathWithIndex
+	for i, entry := range vr.config.Entries {
+		if vr.vaults[i] != nil {
+			result = append(result, VaultPathWithIndex{Path: entry.Path, Index: i})
+		}
+	}
+	return result
+}
+
+// VaultCount returns the number of vaults in the resolver.
+func (vr *VaultResolver) VaultCount() int {
+	return len(vr.vaults)
+}
+
+// IsPathInConfig checks if a vault path is configured
+func (vr *VaultResolver) IsPathInConfig(path string) bool {
+	expanded := ExpandPath(path)
+	for _, entry := range vr.config.Entries {
+		if ExpandPath(entry.Path) == expanded {
+			return true
+		}
+	}
+	return false
+}
+
+// IdentityExistsInVault checks if an identity exists in a specific vault index
+func (vr *VaultResolver) IdentityExistsInVault(fingerprint string, index int) bool {
+	vr.mu.RLock()
+	defer vr.mu.RUnlock()
+
+	if index < 0 || index >= len(vr.vaults) {
+		return false
+	}
+	manager := vr.vaults[index]
+	if manager == nil {
+		return false
+	}
+
+	return manager.GetIdentityByFingerprint(fingerprint) != nil
+}
+
+// SaveVault saves a specific vault by index
+func (vr *VaultResolver) SaveVault(index int) error {
+	vr.mu.Lock()
+	defer vr.mu.Unlock()
+
+	if index < 0 || index >= len(vr.vaults) {
+		return fmt.Errorf("vault index %d out of range", index)
+	}
+	manager := vr.vaults[index]
+	if manager == nil {
+		if loadErr := vr.loadErrors[index]; loadErr != nil {
+			return loadErr
+		}
+		return fmt.Errorf("vault not loaded")
+	}
+
+	if manager.IsReadOnly() {
+		return fmt.Errorf("is read-only")
+	}
+
+	if err := manager.Save(); err != nil {
+		return fmt.Errorf("failed to save vault %d: %w", index+1, err)
+	}
+
+	return nil
+}
+
+// FindSecretVaultIndex returns the index of the first vault where the secret
+// exists and is not deleted. When every vault holding the secret has deleted
+// it, it returns the first of those, so callers can report the deletion. It
+// returns -1 when no vault holds the secret.
+func (vr *VaultResolver) FindSecretVaultIndex(key string) int {
+	vr.mu.RLock()
+	defer vr.mu.RUnlock()
+
+	// Normalize key for lookup (graceful fallback for legacy keys)
+	key = NormalizeKeyForLookup(key)
+
+	deleted := -1
+	for i, manager := range vr.vaults {
+		if manager == nil {
+			continue
+		}
+		secret := manager.GetSecretByKey(key)
+		if secret == nil {
+			continue
+		}
+		if !secret.IsDeleted() {
+			return i
+		}
+		if deleted < 0 {
+			deleted = i
+		}
+	}
+	return deleted
+}
+
+// SecretKeyInfo contains information about a secret key and its location
+type SecretKeyInfo struct {
+	Key      string `json:"key"`
+	Vault    string `json:"vault"`
+	VaultIdx int    `json:"vault_idx"`
+	Deleted  bool   `json:"deleted,omitempty"`
+}
+
+// ListAllSecretKeys returns each secret key once, located in the first vault
+// that holds it undeleted. A key is reported deleted only when every vault
+// holding it has deleted it, and it is then located in the first of those.
+func (vr *VaultResolver) ListAllSecretKeys() []SecretKeyInfo {
+	vr.mu.RLock()
+	defer vr.mu.RUnlock()
+
+	var result []SecretKeyInfo
+	position := make(map[string]int) // key -> index in result
+
+	for i, manager := range vr.vaults {
+		if manager == nil {
+			continue
+		}
+
+		vaultPath := vr.config.Entries[i].Path
+		for _, secret := range manager.vault.Secrets {
+			info := SecretKeyInfo{
+				Key:      secret.Key,
+				Vault:    vaultPath,
+				VaultIdx: i + 1,
+				Deleted:  secret.IsDeleted(),
+			}
+			j, seen := position[secret.Key]
+			if !seen {
+				position[secret.Key] = len(result)
+				result = append(result, info)
+				continue
+			}
+			if result[j].Deleted && !info.Deleted {
+				result[j] = info
+			}
+		}
+	}
+
+	return result
+}
+
+// ListSecretKeysFromVault returns all secret keys from a specific vault
+func (vr *VaultResolver) ListSecretKeysFromVault(index int) []SecretKeyInfo {
+	vr.mu.RLock()
+	defer vr.mu.RUnlock()
+
+	if index < 0 || index >= len(vr.vaults) {
+		return nil
+	}
+
+	manager := vr.vaults[index]
+	if manager == nil {
+		return nil
+	}
+
+	vaultPath := vr.config.Entries[index].Path
+	var result []SecretKeyInfo
+
+	for _, secret := range manager.vault.Secrets {
+		result = append(result, SecretKeyInfo{
+			Key:      secret.Key,
+			Vault:    vaultPath,
+			VaultIdx: index + 1,
+			Deleted:  secret.IsDeleted(),
+		})
+	}
+
+	return result
+}

@@ -1,0 +1,411 @@
+#!/bin/bash
+# e2e-git-credential.sh — E2E tests for the git credential helper
+# Assumes isolated environment (HOME, GNUPGHOME, XDG_*) set up by Makefile
+set -e
+
+BIN="bin/dotsecenv"
+HELPER="contrib/git-credential-dotsecenv"
+chmod +x "$BIN" "$HELPER"
+
+# The helper reads credential.dotsecenv.useUsername through git. HOME and
+# XDG_CONFIG_HOME are already isolated by the Makefile; this closes the last
+# door, so a machine-wide /etc/gitconfig cannot change what the tests see.
+export GIT_CONFIG_NOSYSTEM=1
+
+if ! command -v jq >/dev/null 2>&1; then
+    echo "jq is required for the git credential helper e2e tests" >&2
+    exit 1
+fi
+
+TESTS_RUN=0
+TESTS_PASSED=0
+TESTS_FAILED=0
+
+pass() { echo "  PASS: $*"; ((TESTS_PASSED++)) || true; }
+fail() { echo "  FAIL: $*"; ((TESTS_FAILED++)) || true; }
+
+echo "==> Generating test key"
+"$BIN" identity create --name "Git Cred Test" --email "git@test" --algo RSA4096 --no-passphrase
+
+echo "==> Initializing vault"
+mkdir -p "$XDG_DATA_HOME/dotsecenv"
+"$BIN" init config
+# Keep the config exactly as `init config` writes it (repo-local
+# .dotsecenv/vault first, then the home vault): the helper leans on dotsecenv's
+# own vault resolution, and test 13 exercises the repo-vault half of it.
+"$BIN" init vault -v "$XDG_DATA_HOME/dotsecenv/vault"
+KEY=$(gpg --list-keys --with-colons git@test | awk -F: '/^fpr:/{print $10; exit}')
+"$BIN" login "$KEY"
+
+echo "==> Testing git credential helper"
+
+# Test 1: store then get round-trips username + password through the JSON layer
+((TESTS_RUN++)) || true
+printf 'protocol=https\nhost=gitlab.com\nusername=me\npassword=glpat-xxx\n\n' | "$HELPER" store 2>/dev/null
+get_out=$(printf 'protocol=https\nhost=gitlab.com\n\n' | "$HELPER" get 2>/dev/null)
+if echo "$get_out" | grep -q '^username=me$' && echo "$get_out" | grep -q '^password=glpat-xxx$'; then
+    pass "store then get round-trips username + password"
+else
+    fail "store/get round-trip failed, got: $get_out"
+fi
+
+# Test 2: get on a never-stored host prints nothing and exits 0
+((TESTS_RUN++)) || true
+rc=0
+get_out=$(printf 'protocol=https\nhost=never.stored.example\n\n' | "$HELPER" get 2>/dev/null) || rc=$?
+if [ -z "$get_out" ] && [ "$rc" -eq 0 ]; then
+    pass "get on never-stored host is empty, exit 0"
+else
+    fail "get on never-stored host should be empty/exit0, got: '$get_out' rc=$rc"
+fi
+
+# Test 3: get degrades to empty/exit 0 when the environment has no login/config
+((TESTS_RUN++)) || true
+brokencfg=$(mktemp -d)
+rc=0
+get_out=$(printf 'protocol=https\nhost=gitlab.com\n\n' | XDG_CONFIG_HOME="$brokencfg" XDG_DATA_HOME="$brokencfg" "$HELPER" get 2>/dev/null) || rc=$?
+if [ -z "$get_out" ] && [ "$rc" -eq 0 ]; then
+    pass "get with no login/config degrades to empty, exit 0"
+else
+    fail "get should degrade to empty/exit0, got: '$get_out' rc=$rc"
+fi
+rm -rf "$brokencfg"
+
+# Test 4: erase then get returns empty
+((TESTS_RUN++)) || true
+printf 'protocol=https\nhost=gitlab.com\n\n' | "$HELPER" erase 2>/dev/null
+get_out=$(printf 'protocol=https\nhost=gitlab.com\n\n' | "$HELPER" get 2>/dev/null)
+if [ -z "$get_out" ]; then
+    pass "erase then get returns empty"
+else
+    fail "get after erase should be empty, got: $get_out"
+fi
+
+# Test 5: erase on a never-stored host exits 0 (idempotent)
+((TESTS_RUN++)) || true
+if printf 'protocol=https\nhost=never.stored.example\n\n' | "$HELPER" erase 2>/dev/null; then
+    pass "erase on never-stored host exits 0"
+else
+    fail "erase on never-stored host should exit 0"
+fi
+
+# Test 6: hyphenated host round-trips (proves _DASH_ / _DOT_ encoding)
+((TESTS_RUN++)) || true
+h="git-codecommit.us-east-1.amazonaws.com"
+printf 'protocol=https\nhost=%s\nusername=u\npassword=p6\n\n' "$h" | "$HELPER" store 2>/dev/null
+get_out=$(printf 'protocol=https\nhost=%s\n\n' "$h" | "$HELPER" get 2>/dev/null)
+if echo "$get_out" | grep -q '^password=p6$'; then
+    pass "hyphenated host round-trips"
+else
+    fail "hyphenated host failed, got: $get_out"
+fi
+
+# Test 7: host with port round-trips (proves _COLON_ encoding)
+((TESTS_RUN++)) || true
+printf 'protocol=https\nhost=example.com:8080\nusername=u\npassword=p7\n\n' | "$HELPER" store 2>/dev/null
+get_out=$(printf 'protocol=https\nhost=example.com:8080\n\n' | "$HELPER" get 2>/dev/null)
+if echo "$get_out" | grep -q '^password=p7$'; then
+    pass "host with port round-trips"
+else
+    fail "host with port failed, got: $get_out"
+fi
+
+# Test 8: IP-address host round-trips (proves protocol prefix + dot-free encoding)
+((TESTS_RUN++)) || true
+printf 'protocol=https\nhost=192.168.1.1\nusername=u\npassword=p8\n\n' | "$HELPER" store 2>/dev/null
+get_out=$(printf 'protocol=https\nhost=192.168.1.1\n\n' | "$HELPER" get 2>/dev/null)
+if echo "$get_out" | grep -q '^password=p8$'; then
+    pass "IP-address host round-trips"
+else
+    fail "IP-address host failed, got: $get_out"
+fi
+
+# Test 9: OAuth fields are preserved (Mode 2 contract)
+((TESTS_RUN++)) || true
+printf 'protocol=https\nhost=oauth.example\nusername=oauth2\npassword=at123\npassword_expiry_utc=1799999999\noauth_refresh_token=rt456\n\n' | "$HELPER" store 2>/dev/null
+get_out=$(printf 'protocol=https\nhost=oauth.example\n\n' | "$HELPER" get 2>/dev/null)
+if echo "$get_out" | grep -q '^oauth_refresh_token=rt456$' && echo "$get_out" | grep -q '^password_expiry_utc=1799999999$'; then
+    pass "OAuth refresh token + expiry preserved"
+else
+    fail "OAuth fields not preserved, got: $get_out"
+fi
+
+# Test 10: stored secret names are dot-free (encoded)
+((TESTS_RUN++)) || true
+key_list=$("$BIN" secret get 2>/dev/null || true)
+if echo "$key_list" | grep -qi 'HTTPS\.GITLAB_DOT_COM' && ! echo "$key_list" | grep -qi 'GITLAB\.COM'; then
+    pass "secret names are dot-free (encoded)"
+else
+    fail "expected encoded dot-free key, got keys: $key_list"
+fi
+
+# Test 11: store with no credential fields (host only) stores nothing, exit 0
+((TESTS_RUN++)) || true
+rc=0
+printf 'protocol=https\nhost=empty.example\n\n' | "$HELPER" store 2>/dev/null || rc=$?
+get_out=$(printf 'protocol=https\nhost=empty.example\n\n' | "$HELPER" get 2>/dev/null)
+if [ "$rc" -eq 0 ] && [ -z "$get_out" ]; then
+    pass "store with no fields stores nothing, exit 0"
+else
+    fail "empty store should be a no-op, rc=$rc get='$get_out'"
+fi
+
+# Test 12: unsupported operation exits non-zero
+((TESTS_RUN++)) || true
+if printf 'protocol=https\nhost=gitlab.com\n\n' | "$HELPER" bogus 2>/dev/null; then
+    fail "unsupported operation should exit non-zero"
+else
+    pass "unsupported operation exits non-zero"
+fi
+
+# Test 13: a repo-local committed vault is a first-class store target, by
+# design. Vault selection is dotsecenv's: with DOTSECENV_CONFIG pointing at a
+# config that resolves only the repo vault, the credential lands encrypted in
+# the repo's own .dotsecenv/vault and erase works the same way. (With several
+# resolvable vaults, store/erase use dotsecenv's interactive picker — not
+# testable without a TTY, and covered by the CLI's own tests.)
+((TESTS_RUN++)) || true
+proj="$PWD/projrepo"
+mkdir -p "$proj"
+(cd "$proj" && "$OLDPWD/$BIN" init vault -v .dotsecenv/vault >/dev/null 2>&1)
+altcfg="$PWD/git-credentials-config"
+DOTSECENV_CONFIG="$altcfg" "$BIN" init config >/dev/null 2>&1
+grep -Fv "$XDG_DATA_HOME/dotsecenv/vault" "$altcfg" > "$altcfg.tmp" && mv "$altcfg.tmp" "$altcfg"
+(cd "$proj" && DOTSECENV_CONFIG="$altcfg" "$OLDPWD/$BIN" login "$KEY" >/dev/null 2>&1)
+h="proj.example"
+store_rc=0
+(cd "$proj" && printf 'protocol=https\nhost=%s\nusername=me\npassword=pv-1\n\n' "$h" \
+    | DOTSECENV_CONFIG="$altcfg" "$OLDPWD/$HELPER" store) >/dev/null 2>&1 || store_rc=$?
+proj_get=$(cd "$proj" && printf 'protocol=https\nhost=%s\n\n' "$h" | DOTSECENV_CONFIG="$altcfg" "$OLDPWD/$HELPER" get 2>/dev/null || true)
+in_repo_vault=0
+grep -q 'HTTPS\.PROJ_DOT_EXAMPLE' "$proj/.dotsecenv/vault" 2>/dev/null && in_repo_vault=1
+erase_rc=0
+(cd "$proj" && printf 'protocol=https\nhost=%s\n\n' "$h" | DOTSECENV_CONFIG="$altcfg" "$OLDPWD/$HELPER" erase) >/dev/null 2>&1 || erase_rc=$?
+after_erase=$(cd "$proj" && printf 'protocol=https\nhost=%s\n\n' "$h" | DOTSECENV_CONFIG="$altcfg" "$OLDPWD/$HELPER" get 2>/dev/null || true)
+if [ "$store_rc" -eq 0 ] && echo "$proj_get" | grep -q 'password=pv-1' \
+    && [ "$in_repo_vault" -eq 1 ] && [ "$erase_rc" -eq 0 ] && [ -z "$after_erase" ]; then
+    pass "repo-local vault is the store target via DOTSECENV_CONFIG"
+else
+    fail "repo-vault workflow failed: store_rc=$store_rc get='$proj_get' in_repo_vault=$in_repo_vault erase_rc=$erase_rc after_erase='$after_erase'"
+fi
+
+# Test 14: runs of underscores stay distinct. The encoder used to collapse three
+# or more underscores into two, so a_-b, a__-b and a___-b all shared one key and
+# overwrote each other. Escaping '_' first keeps them apart.
+((TESTS_RUN++)) || true
+printf 'protocol=https\nhost=a_-b.example\nusername=u\npassword=p14a\n\n' | "$HELPER" store 2>/dev/null
+printf 'protocol=https\nhost=a__-b.example\nusername=u\npassword=p14b\n\n' | "$HELPER" store 2>/dev/null
+printf 'protocol=https\nhost=a___-b.example\nusername=u\npassword=p14c\n\n' | "$HELPER" store 2>/dev/null
+run_a=$(printf 'protocol=https\nhost=a_-b.example\n\n' | "$HELPER" get 2>/dev/null)
+run_b=$(printf 'protocol=https\nhost=a__-b.example\n\n' | "$HELPER" get 2>/dev/null)
+run_c=$(printf 'protocol=https\nhost=a___-b.example\n\n' | "$HELPER" get 2>/dev/null)
+if echo "$run_a" | grep -q '^password=p14a$' && echo "$run_b" | grep -q '^password=p14b$' \
+    && echo "$run_c" | grep -q '^password=p14c$'; then
+    pass "underscore runs keep separate keys"
+else
+    fail "underscore runs collided: one='$run_a' two='$run_b' three='$run_c'"
+fi
+
+# Test 15: a trailing underscore is part of the name. It used to be stripped, so
+# c.example_ landed on c.example's key and served that host's credential.
+((TESTS_RUN++)) || true
+printf 'protocol=https\nhost=c.example\nusername=u\npassword=p15a\n\n' | "$HELPER" store 2>/dev/null
+printf 'protocol=https\nhost=c.example_\nusername=u\npassword=p15b\n\n' | "$HELPER" store 2>/dev/null
+tail_plain=$(printf 'protocol=https\nhost=c.example\n\n' | "$HELPER" get 2>/dev/null)
+tail_under=$(printf 'protocol=https\nhost=c.example_\n\n' | "$HELPER" get 2>/dev/null)
+if echo "$tail_plain" | grep -q '^password=p15a$' && echo "$tail_under" | grep -q '^password=p15b$'; then
+    pass "trailing underscore keeps a separate key"
+else
+    fail "trailing underscore collided: plain='$tail_plain' underscore='$tail_under'"
+fi
+
+# Test 16: an ephemeral credential is never written to the vault. git-credential(1)
+# says a helper must not save the value in the credential field when ephemeral is
+# set, and a stored copy would also be replayed on the next get.
+((TESTS_RUN++)) || true
+printf 'protocol=https\nhost=eph.example\nusername=u\nauthtype=Digest\ncredential=nonce-bound\nephemeral=1\n\n' | "$HELPER" store 2>/dev/null
+eph_out=$(printf 'protocol=https\nhost=eph.example\n\n' | "$HELPER" get 2>/dev/null)
+if ! echo "$eph_out" | grep -q 'nonce-bound' && ! echo "$eph_out" | grep -q '^ephemeral=' \
+    && ! echo "$eph_out" | grep -q '^authtype='; then
+    pass "ephemeral credential is not stored"
+else
+    fail "ephemeral credential leaked into the vault, got: $eph_out"
+fi
+
+# Test 17: when git names the account it wants, a record for a different account
+# is not an answer. git takes the helper's username over the one it asked for, so
+# replying here would authenticate as the wrong person.
+((TESTS_RUN++)) || true
+printf 'protocol=https\nhost=two.example\nusername=alice\npassword=alice-token\n\n' | "$HELPER" store 2>/dev/null
+wrong_user=$(printf 'protocol=https\nhost=two.example\nusername=bob\n\n' | "$HELPER" get 2>/dev/null)
+right_user=$(printf 'protocol=https\nhost=two.example\nusername=alice\n\n' | "$HELPER" get 2>/dev/null)
+if [ -z "$wrong_user" ] && echo "$right_user" | grep -q '^password=alice-token$'; then
+    pass "get stays silent when the stored account is not the one git asked for"
+else
+    fail "username mismatch mishandled: bob='$wrong_user' alice='$right_user'"
+fi
+
+# Test 18: credential.dotsecenv.useUsername gives each account its own key, so two
+# accounts on one host stop overwriting each other. git reads the setting on the
+# helper's behalf, so the case needs git installed.
+if command -v git >/dev/null 2>&1; then
+    ((TESTS_RUN++)) || true
+    printf '[credential "dotsecenv"]\n\tuseUsername = true\n' > "$HOME/.gitconfig"
+    printf 'protocol=https\nhost=multi.example\nusername=alice\npassword=alice-pw\n\n' | "$HELPER" store 2>/dev/null
+    printf 'protocol=https\nhost=multi.example\nusername=bob\npassword=bob-pw\n\n' | "$HELPER" store 2>/dev/null
+    scoped_alice=$(printf 'protocol=https\nhost=multi.example\nusername=alice\n\n' | "$HELPER" get 2>/dev/null)
+    scoped_bob=$(printf 'protocol=https\nhost=multi.example\nusername=bob\n\n' | "$HELPER" get 2>/dev/null)
+    rm -f "$HOME/.gitconfig"
+    if echo "$scoped_alice" | grep -q '^password=alice-pw$' && echo "$scoped_bob" | grep -q '^password=bob-pw$'; then
+        pass "useUsername keeps two accounts on one host apart"
+    else
+        fail "username scoping failed: alice='$scoped_alice' bob='$scoped_bob'"
+    fi
+else
+    echo "  SKIP: git not installed, useUsername case not exercised"
+fi
+
+# Test 19: an IPv6 literal round-trips. git sends the brackets as part of the
+# host (host=[::1]:8443), so they are encoded by name rather than falling through
+# to the catch-all, and two ports on one address stay apart.
+((TESTS_RUN++)) || true
+printf 'protocol=https\nhost=[::1]:8443\nusername=u\npassword=p19a\n\n' | "$HELPER" store 2>/dev/null
+printf 'protocol=https\nhost=[::1]:9443\nusername=u\npassword=p19b\n\n' | "$HELPER" store 2>/dev/null
+v6a=$(printf 'protocol=https\nhost=[::1]:8443\n\n' | "$HELPER" get 2>/dev/null)
+v6b=$(printf 'protocol=https\nhost=[::1]:9443\n\n' | "$HELPER" get 2>/dev/null)
+v6key=$("$BIN" secret get 2>/dev/null | grep -c 'LBRK' || true)
+if echo "$v6a" | grep -q '^password=p19a$' && echo "$v6b" | grep -q '^password=p19b$' \
+    && [ "$v6key" -ge 1 ]; then
+    pass "IPv6 host round-trips with brackets encoded by name"
+else
+    fail "IPv6 host failed: 8443='$v6a' 9443='$v6b' bracket_keys=$v6key"
+fi
+
+# Test 20: credential.useHttpPath. git only sends `path` when it is on, so the
+# helper keys per repository. Nothing exercised this before.
+((TESTS_RUN++)) || true
+printf 'protocol=https\nhost=gh.test\npath=acme/api\nusername=u1\npassword=tok-api\n\n' | "$HELPER" store 2>/dev/null
+printf 'protocol=https\nhost=gh.test\npath=acme/web\nusername=u2\npassword=tok-web\n\n' | "$HELPER" store 2>/dev/null
+p_api=$(printf 'protocol=https\nhost=gh.test\npath=acme/api\n\n' | "$HELPER" get 2>/dev/null)
+p_web=$(printf 'protocol=https\nhost=gh.test\npath=acme/web\n\n' | "$HELPER" get 2>/dev/null)
+p_none=$(printf 'protocol=https\nhost=gh.test\n\n' | "$HELPER" get 2>/dev/null)
+if echo "$p_api" | grep -q '^password=tok-api$' && echo "$p_web" | grep -q '^password=tok-web$' \
+    && [ -z "$p_none" ]; then
+    pass "useHttpPath keys per repository"
+else
+    fail "useHttpPath failed: api='$p_api' web='$p_web' hostonly='$p_none'"
+fi
+
+# Test 21: erase under useHttpPath takes one repository, not the host.
+((TESTS_RUN++)) || true
+printf 'protocol=https\nhost=gh.test\npath=acme/api\n\n' | "$HELPER" erase 2>/dev/null
+e_api=$(printf 'protocol=https\nhost=gh.test\npath=acme/api\n\n' | "$HELPER" get 2>/dev/null)
+e_web=$(printf 'protocol=https\nhost=gh.test\npath=acme/web\n\n' | "$HELPER" get 2>/dev/null)
+if [ -z "$e_api" ] && echo "$e_web" | grep -q '^password=tok-web$'; then
+    pass "erase under useHttpPath is scoped to one repository"
+else
+    fail "erase hit the wrong scope: api='$e_api' web='$e_web'"
+fi
+
+# Test 22: a path and a username cannot bleed into each other. Encoding the
+# whole context in one pass made `path=p/u` and `path=p` + `username=u` the same
+# key, so an anonymous request for the first was answered with the second's
+# token. Components are encoded separately and joined on a dot for this reason.
+if command -v git >/dev/null 2>&1; then
+    ((TESTS_RUN++)) || true
+    printf '[credential "dotsecenv"]\n\tuseUsername = true\n' > "$HOME/.gitconfig"
+    printf 'protocol=https\nhost=b.test\npath=p\nusername=u\npassword=tok-p-u\n\n' | "$HELPER" store 2>/dev/null
+    bleed=$(printf 'protocol=https\nhost=b.test\npath=p/u\n\n' | "$HELPER" get 2>/dev/null)
+    scoped=$(printf 'protocol=https\nhost=b.test\npath=p\nusername=u\n\n' | "$HELPER" get 2>/dev/null)
+    rm -f "$HOME/.gitconfig"
+    if [ -z "$bleed" ] && echo "$scoped" | grep -q '^password=tok-p-u$'; then
+        pass "path and username components stay separate"
+    else
+        fail "component bleed: path=p/u got '$bleed', scoped got '$scoped'"
+    fi
+else
+    echo "  SKIP: git not installed, component boundary case not exercised"
+fi
+
+# Test 23: a space in a path round-trips. Some forges allow it (Azure DevOps
+# project names), and it used to fall through to the _OTHER_ catch-all.
+((TESTS_RUN++)) || true
+printf 'protocol=https\nhost=dev.test\npath=My Project/_git/api\nusername=u\npassword=tok-space\n\n' | "$HELPER" store 2>/dev/null
+sp_out=$(printf 'protocol=https\nhost=dev.test\npath=My Project/_git/api\n\n' | "$HELPER" get 2>/dev/null)
+sp_key=$("$BIN" secret get 2>/dev/null | grep -c '_SP_' || true)
+if echo "$sp_out" | grep -q '^password=tok-space$' && [ "$sp_key" -ge 1 ]; then
+    pass "space in a path round-trips and is encoded by name"
+else
+    fail "space path failed: get='$sp_out' sp_keys=$sp_key"
+fi
+
+# Test 24: the .git suffix does not split a repository in two. git passes the
+# path as the remote spells it, so storing under `team/api.git` and fetching
+# under `team/api` used to miss and prompt again.
+((TESTS_RUN++)) || true
+printf 'protocol=https\nhost=suf.test\npath=team/api.git\nusername=u\npassword=tok-suffix\n\n' | "$HELPER" store 2>/dev/null
+suf_bare=$(printf 'protocol=https\nhost=suf.test\npath=team/api\n\n' | "$HELPER" get 2>/dev/null)
+suf_dot=$(printf 'protocol=https\nhost=suf.test\npath=team/api.git\n\n' | "$HELPER" get 2>/dev/null)
+suf_keys=$("$BIN" secret get 2>/dev/null | grep -c 'SUF_DOT_TEST' || true)
+if echo "$suf_bare" | grep -q '^password=tok-suffix$' && echo "$suf_dot" | grep -q '^password=tok-suffix$' \
+    && [ "$suf_keys" -eq 1 ]; then
+    pass "the .git suffix resolves to one entry"
+else
+    fail ".git suffix split the repository: bare='$suf_bare' dotgit='$suf_dot' keys=$suf_keys"
+fi
+
+# Test 25: a path of exactly `.git` keeps it. Trimming would leave nothing and
+# quietly widen the key from one repository to the whole host.
+((TESTS_RUN++)) || true
+printf 'protocol=https\nhost=bare.test\npath=.git\nusername=u\npassword=tok-dotgit\n\n' | "$HELPER" store 2>/dev/null
+only_dot=$(printf 'protocol=https\nhost=bare.test\npath=.git\n\n' | "$HELPER" get 2>/dev/null)
+host_wide=$(printf 'protocol=https\nhost=bare.test\n\n' | "$HELPER" get 2>/dev/null)
+if echo "$only_dot" | grep -q '^password=tok-dotgit$' && [ -z "$host_wide" ]; then
+    pass "a path of .git stays scoped to the path"
+else
+    fail ".git-only path mishandled: path='$only_dot' hostonly='$host_wide'"
+fi
+
+# Test 26: a credential stored after erase replaces the erased one. git erases a
+# credential the server rejected, then stores the one that works.
+((TESTS_RUN++)) || true
+printf 'protocol=https\nhost=retry.example\nusername=user\npassword=old-token\n\n' | "$HELPER" store 2>/dev/null
+printf 'protocol=https\nhost=retry.example\n\n' | "$HELPER" erase 2>/dev/null
+store_rc=0
+printf 'protocol=https\nhost=retry.example\nusername=user\npassword=new-token\n\n' | "$HELPER" store 2>/dev/null || store_rc=$?
+retry=$(printf 'protocol=https\nhost=retry.example\n\n' | "$HELPER" get 2>/dev/null)
+if [ "$store_rc" -eq 0 ] && echo "$retry" | grep -q '^password=new-token$'; then
+    pass "store after erase saves the replacement"
+else
+    fail "store after erase failed: rc=$store_rc get='$retry'"
+fi
+
+# Test 27: the same sequence through git itself. A failing helper store does not
+# fail `git credential approve`, so only `fill` shows whether the replacement
+# landed. GIT_TERMINAL_PROMPT=0 turns a miss into an error instead of a prompt.
+if command -v git >/dev/null 2>&1; then
+    ((TESTS_RUN++)) || true
+    gitcred() { GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c credential.helper="$PWD/$HELPER" credential "$@"; }
+    printf 'protocol=https\nhost=approve.example\nusername=user\npassword=rejected-token\n\n' | gitcred approve 2>/dev/null
+    printf 'protocol=https\nhost=approve.example\nusername=user\npassword=rejected-token\n\n' | gitcred reject 2>/dev/null
+    printf 'protocol=https\nhost=approve.example\nusername=user\npassword=working-token\n\n' | gitcred approve 2>/dev/null
+    filled=$(printf 'protocol=https\nhost=approve.example\n\n' | gitcred fill 2>/dev/null || true)
+    if echo "$filled" | grep -q '^password=working-token$'; then
+        pass "git credential approve, reject, approve, fill returns the replacement"
+    else
+        fail "git did not get the replacement credential back, fill gave: '$filled'"
+    fi
+else
+    echo "  SKIP: git not installed, git credential plumbing case not exercised"
+fi
+
+echo ""
+echo "==> Git credential helper E2E results"
+echo "Tests run:    $TESTS_RUN"
+echo "Tests passed: $TESTS_PASSED"
+echo "Tests failed: $TESTS_FAILED"
+
+if [ "$TESTS_FAILED" -gt 0 ]; then
+    exit 1
+fi
+echo "==> All tests passed"

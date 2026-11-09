@@ -1,0 +1,3 @@
+[tools]
+# https://mise.jdx.dev/dev-tools/backends/github.html
+"github:dotsecenv/dotsecenv" = { version = "latest", os = ["linux", "macos"], github = { github_attestations = true, slsa = true } }

@@ -1,0 +1,318 @@
+.PHONY: help
+help:
+	@echo "dotsecenv Makefile targets:"
+	@echo "  make all            - Run all targets"
+	@echo "  make clean          - Clean build artifacts"
+	@echo "  make update         - Update go dependencies"
+	@echo "  make build          - Build with FIPS 140-3 crypto (no CGO)"
+	@echo "  make build-link     - Build and symlink to ~/.local/bin/dotsecenv"
+	@echo "  make fmt            - Format Go code"
+	@echo "  make lint           - Run linting (vet + fmt check)"
+	@echo "  make test           - Run tests"
+	@echo "  make test-race      - Run tests with race condition detection"
+	@echo "  make e2e            - Run end-to-end tests using bin/dotsecenv"
+	@echo "  make e2e-terraform  - Run Terraform credentials helper E2E tests"
+	@echo "  make e2e-git-credential - Run git credential helper E2E tests"
+	@echo "  make e2e-install    - Run install.sh E2E tests (requires network)"
+	@echo "  make sandbox        - Create an interactive sandbox environment"
+	@echo "  make demo           - Run demo recording in sandbox (requires asciinema)"
+	@echo "  make completions    - Generate shell completions"
+	@echo "  make docs           - Generate markdown documentation"
+	@echo "  make man            - Generate man pages"
+	@echo "  make plugin         - Copy or clone shell plugin files for packaging"
+	@echo "  make hooks          - Install git hooks using lefthook"
+	@echo "  make release-test   - Test release build (snapshot)"
+	@echo "  make install-tools  - Install all dev tools"
+
+.PHONY: all
+all: clean update build lint test test-race e2e e2e-terraform e2e-git-credential e2e-install completions docs man plugin
+
+# Common ldflags for version info. --match skips the rolling major tag (v0),
+# so a build between releases reports vX.Y.Z-N-g<sha>, which dotsecenv reads
+# as release X.Y.Z when it stamps a vault.
+LDFLAGS := -X main.version=$$(git describe --tags --match 'v[0-9]*.[0-9]*.[0-9]*' --always --dirty) -X main.commit=$$(git rev-parse --short HEAD) -X main.date=$$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+.PHONY: clean
+clean:
+	@rm -rf bin/ build/ dist/
+	echo "Reinitializing dotsecenv vault..."
+	go clean -testcache
+	
+# Build with Go's native FIPS 140-3 module (no CGO required)
+# Uses vendored dependencies for hermetic builds
+# See: https://go.dev/blog/fips140
+.PHONY: build
+build:
+	@echo "Building dotsecenv with FIPS 140-3 crypto..."
+	CGO_ENABLED=0 GOFIPS140=v1.26.0 go build -mod=vendor -ldflags "-s -w $(LDFLAGS)" -o bin/dotsecenv ./cmd/dotsecenv
+	@echo "Binary built at: bin/dotsecenv"
+
+.PHONY: build-link
+build-link: build
+	@mkdir -p ~/.local/bin
+	@ln -sf $(CURDIR)/bin/dotsecenv ~/.local/bin/dotsecenv
+	@echo "Symlinked ~/.local/bin/dotsecenv -> $(CURDIR)/bin/dotsecenv"
+
+.PHONY: fmt
+fmt:
+	@echo "Formatting Go code..."
+	@find . -name '*.go' -not -path './vendor/*' -exec gofmt -s -w {} +
+	@$(GOLANGCI_LINT) run --fix ./...
+
+.PHONY: lint
+lint: install-lint
+	@echo "Running go mod tidy..."
+	@go mod tidy
+	@echo "Checking code formatting..."
+	@if [ -n "$$(gofmt -l . | grep -vE '(^|/)vendor/')" ]; then \
+		echo "Go code is not formatted:"; \
+		gofmt -l . | grep -vE '(^|/)vendor/'; \
+		exit 1; \
+	fi
+	@echo "Checking packages/retracted.txt against go.mod..."
+	@./scripts/extract-retracted.sh go.mod | diff -u packages/retracted.txt - || { \
+		echo "Regenerate it: ./scripts/extract-retracted.sh go.mod > packages/retracted.txt"; \
+		exit 1; \
+	}
+	@echo "Running golangci-lint..."
+	@$(GOLANGCI_LINT) run ./...
+
+.PHONY: test
+test:
+	@echo "Running tests..."
+	go test -v -p 1 ./...
+
+.PHONY: test-race
+test-race:
+	@echo "Running tests with race condition detection..."
+	go test -race -v -p 1 ./...
+
+# E2E tests in isolated environment
+# Requires bin/dotsecenv to exist (run `make build` first, or download pre-built)
+.PHONY: e2e
+e2e:
+	@echo "Running e2e tests in isolated environment..."
+	@E2E_HOME=$$(mktemp -d) && \
+	mkdir -p "$$E2E_HOME/.gnupg" "$$E2E_HOME/.config" "$$E2E_HOME/.local/share" "$$E2E_HOME/.local/state" "$$E2E_HOME/.cache" "$$E2E_HOME/bin" && \
+	chmod 700 "$$E2E_HOME/.gnupg" && \
+	cp bin/dotsecenv "$$E2E_HOME/bin/" && \
+	cp scripts/e2e.sh "$$E2E_HOME/" && \
+	echo "E2E environment: $$E2E_HOME" && \
+	cd "$$E2E_HOME" && \
+	HOME="$$E2E_HOME" \
+	PATH="$$E2E_HOME/bin:$$PATH" \
+	GNUPGHOME="$$E2E_HOME/.gnupg" \
+	XDG_CONFIG_HOME="$$E2E_HOME/.config" \
+	XDG_DATA_HOME="$$E2E_HOME/.local/share" \
+	XDG_STATE_HOME="$$E2E_HOME/.local/state" \
+	XDG_CACHE_HOME="$$E2E_HOME/.cache" \
+	bash ./e2e.sh $(E2E_FLAGS) && \
+	rm -rf "$$E2E_HOME" && \
+	echo "E2E tests passed, cleaned up $$E2E_HOME"
+
+# Terraform credentials helper E2E tests
+# Requires bin/dotsecenv and contrib/ to exist
+.PHONY: e2e-terraform
+e2e-terraform:
+	@echo "Running terraform credentials helper e2e tests..."
+	@E2E_HOME=$$(mktemp -d) && \
+	mkdir -p "$$E2E_HOME/.gnupg" "$$E2E_HOME/.config" "$$E2E_HOME/.local/share" "$$E2E_HOME/.local/state" "$$E2E_HOME/.cache" "$$E2E_HOME/bin" "$$E2E_HOME/contrib" && \
+	chmod 700 "$$E2E_HOME/.gnupg" && \
+	cp bin/dotsecenv "$$E2E_HOME/bin/" && \
+	cp contrib/terraform-credentials-dotsecenv "$$E2E_HOME/contrib/" && \
+	cp scripts/e2e-terraform.sh "$$E2E_HOME/" && \
+	echo "E2E environment: $$E2E_HOME" && \
+	cd "$$E2E_HOME" && \
+	HOME="$$E2E_HOME" \
+	PATH="$$E2E_HOME/bin:$$PATH" \
+	GNUPGHOME="$$E2E_HOME/.gnupg" \
+	XDG_CONFIG_HOME="$$E2E_HOME/.config" \
+	XDG_DATA_HOME="$$E2E_HOME/.local/share" \
+	XDG_STATE_HOME="$$E2E_HOME/.local/state" \
+	XDG_CACHE_HOME="$$E2E_HOME/.cache" \
+	bash ./e2e-terraform.sh && \
+	rm -rf "$$E2E_HOME" && \
+	echo "Terraform e2e tests passed, cleaned up $$E2E_HOME"
+
+# Git credential helper E2E tests
+# Requires bin/dotsecenv, contrib/, gpg, and jq to exist. git is optional: it
+# only gates the credential.dotsecenv.useUsername case, which skips without it.
+.PHONY: e2e-git-credential
+e2e-git-credential:
+	@echo "Running git credential helper e2e tests..."
+	@E2E_HOME=$$(mktemp -d) && \
+	mkdir -p "$$E2E_HOME/.gnupg" "$$E2E_HOME/.config" "$$E2E_HOME/.local/share" "$$E2E_HOME/.local/state" "$$E2E_HOME/.cache" "$$E2E_HOME/bin" "$$E2E_HOME/contrib" && \
+	chmod 700 "$$E2E_HOME/.gnupg" && \
+	cp bin/dotsecenv "$$E2E_HOME/bin/" && \
+	cp contrib/git-credential-dotsecenv "$$E2E_HOME/contrib/" && \
+	cp scripts/e2e-git-credential.sh "$$E2E_HOME/" && \
+	echo "E2E environment: $$E2E_HOME" && \
+	cd "$$E2E_HOME" && \
+	HOME="$$E2E_HOME" \
+	PATH="$$E2E_HOME/bin:$$PATH" \
+	GNUPGHOME="$$E2E_HOME/.gnupg" \
+	XDG_CONFIG_HOME="$$E2E_HOME/.config" \
+	XDG_DATA_HOME="$$E2E_HOME/.local/share" \
+	XDG_STATE_HOME="$$E2E_HOME/.local/state" \
+	XDG_CACHE_HOME="$$E2E_HOME/.cache" \
+	bash ./e2e-git-credential.sh && \
+	rm -rf "$$E2E_HOME" && \
+	echo "Git credential e2e tests passed, cleaned up $$E2E_HOME"
+
+# Install script E2E tests (requires network)
+.PHONY: e2e-install
+e2e-install:
+	@echo "Running install.sh e2e tests..."
+	@bash scripts/e2e-install.sh
+
+# Interactive sandbox for manual testing
+.PHONY: sandbox
+sandbox: build
+	@echo "Creating interactive sandbox..."
+	@scripts/sandbox.sh --binary bin/dotsecenv
+
+# Demo recording environment (for asciinema)
+.PHONY: demo
+demo: build
+	@echo "Setting up demo environment..."
+	@DEMO_HOME=$$(mktemp -d) && \
+	mkdir -p "$$DEMO_HOME/.gnupg" "$$DEMO_HOME/.config" "$$DEMO_HOME/.local/share" "$$DEMO_HOME/.local/state" "$$DEMO_HOME/.cache" "$$DEMO_HOME/bin" "$$DEMO_HOME/demos" && \
+	chmod 700 "$$DEMO_HOME/.gnupg" && \
+	cp bin/dotsecenv "$$DEMO_HOME/bin/" && \
+	cp demos/demo.sh "$$DEMO_HOME/demos/" && \
+	chmod +x "$$DEMO_HOME/demos/demo.sh" && \
+	echo "Downloading demo-magic..." && \
+	curl -fsSL https://raw.githubusercontent.com/paxtonhare/demo-magic/master/demo-magic.sh -o "$$DEMO_HOME/demos/_demo-magic.sh" && \
+	if [ -d ./plugin ]; then \
+		mkdir -p "$$DEMO_HOME/.local/share/dotsecenv"; \
+		cp ./plugin/_dotsecenv_core.sh "$$DEMO_HOME/.local/share/dotsecenv/" 2>/dev/null || true; \
+		cp ./plugin/dotsecenv.plugin.bash "$$DEMO_HOME/.local/share/dotsecenv/" 2>/dev/null || true; \
+		cp ./plugin/dotsecenv.plugin.zsh "$$DEMO_HOME/.local/share/dotsecenv/" 2>/dev/null || true; \
+		printf '%s\n' \
+			'# dotsecenv demo bashrc' \
+			'[ -f "$$XDG_DATA_HOME/dotsecenv/dotsecenv.plugin.bash" ] && source "$$XDG_DATA_HOME/dotsecenv/dotsecenv.plugin.bash"' \
+			> "$$DEMO_HOME/.bashrc"; \
+	fi && \
+	echo "Generating GPG key for demo (via dotsecenv identity create)..." && \
+	HOME="$$DEMO_HOME" GNUPGHOME="$$DEMO_HOME/.gnupg" "$$DEMO_HOME/bin/dotsecenv" identity create --no-passphrase --name "Demo User" --email "demo@dotsecenv" && \
+	if [ -d ./website/public ]; then \
+		DEMO_OUT="$$(cd ./website/public && pwd)/demo.cast"; \
+	else \
+		DEMO_OUT="$$(pwd)/demo.cast"; \
+	fi && \
+	echo "" && \
+	echo "Demo environment ready at:   $$DEMO_HOME" && \
+	echo "Recording will be saved to:  $$DEMO_OUT" && \
+	echo "                             (outside the sandbox so it survives cleanup)" && \
+	echo "" && \
+	echo "To record (asciinema v3+), paste:" && \
+	echo "  asciinema record -c 'demos/demo.sh' --title 'DotSecEnv demo' --overwrite '$$DEMO_OUT'" && \
+	echo "" && \
+	echo "Entering demo shell (type 'exit' when done)..." && \
+	cd "$$DEMO_HOME" && \
+	HOME="$$DEMO_HOME" \
+	PATH="$$DEMO_HOME/bin:$$PATH" \
+	GNUPGHOME="$$DEMO_HOME/.gnupg" \
+	XDG_CONFIG_HOME="$$DEMO_HOME/.config" \
+	XDG_DATA_HOME="$$DEMO_HOME/.local/share" \
+	XDG_STATE_HOME="$$DEMO_HOME/.local/state" \
+	XDG_CACHE_HOME="$$DEMO_HOME/.cache" \
+	DEMO_OUT="$$DEMO_OUT" \
+	bash -i && \
+	echo "Cleaning up $$DEMO_HOME" && \
+	rm -rf "$$DEMO_HOME"
+
+.PHONY: update
+update:
+	@echo "Updating dependencies..."
+	@go get -u ./...
+
+.PHONY: completions
+completions: build
+	@echo "Generating shell completions..."
+	@mkdir -p build/completions
+	@bin/dotsecenv completion bash > build/completions/dotsecenv.bash
+	@bin/dotsecenv completion zsh > build/completions/dotsecenv.zsh
+	@bin/dotsecenv completion fish > build/completions/dotsecenv.fish
+	@bin/dotsecenv completion powershell > build/completions/dotsecenv.ps1
+
+.PHONY: docs
+docs:
+	@echo "Generating markdown documentation..."
+	@go run -tags gendocs ./cmd/dotsecenv markdown -o build/cli
+
+.PHONY: man
+man:
+	@echo "Generating man pages..."
+	@go run -tags gendocs ./cmd/dotsecenv -o build/man/man1
+
+.PHONY: plugin
+plugin:
+	@echo "Copying plugin files from ./plugin/..."
+	@mkdir -p build/plugin/conf.d
+	@cp ./plugin/_dotsecenv_core.sh ./plugin/dotsecenv.plugin.bash \
+	    ./plugin/dotsecenv.plugin.zsh build/plugin/
+	@cp ./plugin/conf.d/dotsecenv.fish build/plugin/conf.d/
+
+.PHONY: hooks
+hooks: install-lefthook
+	@echo "Installing git hooks..."
+	@$(LEFTHOOK) install
+
+.PHONY: release-test
+release-test: install-goreleaser install-syft
+	@echo "Testing release build..."
+	@$(GORELEASER) release --snapshot --clean --skip=sign,publish,nfpm
+
+# =============================================================================
+# Development Tool Installation
+# =============================================================================
+
+GOBIN := $(or $(shell go env GOBIN),$(shell go env GOPATH)/bin)
+
+.PHONY: install-tools
+install-tools: install-lefthook install-lint install-syft install-goreleaser
+
+LEFTHOOK := $(GOBIN)/lefthook
+
+.PHONY: install-lefthook
+install-lefthook:
+	@if ! [ -x "$(LEFTHOOK)" ]; then \
+		echo "Installing lefthook..."; \
+		go install github.com/evilmartians/lefthook/v2@v2.0.13; \
+	fi
+
+# Pinned to v2.15.0: the go.mod directive targets 1.27.3, so golangci-lint must
+# be built with Go >= 1.27 or `run` aborts with a language-version error.
+# Installed with `go install` instead of the upstream install.sh: the v2.12.x and
+# v2.13.2 release tarballs fail install.sh's checksum step (the published tarball
+# and its _checksums.txt disagree). Building from source with the go.mod toolchain
+# sidesteps the bad checksums and guarantees a Go >= 1.27 build.
+GOLANGCI_LINT_VERSION := v2.15.0
+GOLANGCI_LINT := $(GOBIN)/golangci-lint
+GOLANGCI_LINT_PKG := github.com/golangci/golangci-lint/v2/cmd/golangci-lint
+
+.PHONY: install-lint
+install-lint:
+	@if ! [ -x "$(GOLANGCI_LINT)" ]; then \
+		echo "Installing golangci-lint $(GOLANGCI_LINT_VERSION)..."; \
+		GOFLAGS= GOBIN=$(GOBIN) go install $(GOLANGCI_LINT_PKG)@$(GOLANGCI_LINT_VERSION); \
+	fi
+
+SYFT := $(GOBIN)/syft
+
+.PHONY: install-syft
+install-syft:
+	@if ! [ -x "$(SYFT)" ]; then \
+		echo "Installing syft..."; \
+		curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b $(GOBIN); \
+	fi
+
+GORELEASER := $(GOBIN)/goreleaser
+
+.PHONY: install-goreleaser
+install-goreleaser:
+	@if ! [ -x "$(GORELEASER)" ]; then \
+		echo "Installing goreleaser..."; \
+		go install github.com/goreleaser/goreleaser/v2@latest; \
+	fi

@@ -1,0 +1,426 @@
+package main_test
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"gopkg.in/yaml.v3"
+)
+
+// configForTest represents the config file structure for test assertions
+type configForTest struct {
+	ApprovedAlgorithms []struct {
+		Algo    string   `yaml:"algo"`
+		Curves  []string `yaml:"curves,omitempty"`
+		MinBits int      `yaml:"min_bits"`
+	} `yaml:"approved_algorithms"`
+	Login *struct {
+		Fingerprint string `yaml:"fingerprint"`
+	} `yaml:"login,omitempty"`
+	Vault    []string `yaml:"vault"`
+	Behavior struct {
+		RequireExplicitVaultUpgrade *bool `yaml:"require_explicit_vault_upgrade,omitempty"`
+		RestrictToConfiguredVaults  *bool `yaml:"restrict_to_configured_vaults,omitempty"`
+	} `yaml:"behavior,omitempty"`
+	GPG struct {
+		Program string `yaml:"program,omitempty"`
+	} `yaml:"gpg,omitempty"`
+}
+
+func loadConfigForTest(t *testing.T, path string) configForTest {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("failed to read config file: %v", err)
+	}
+	var cfg configForTest
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("failed to parse config file: %v", err)
+	}
+	return cfg
+}
+
+func TestInitConfig_HasBehaviorSection(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+
+	// Run init config
+	_, stderr, err := runCmd("init", "config", "-c", configPath)
+	if err != nil {
+		t.Fatalf("init config failed: %v\nSTDERR: %s", err, stderr)
+	}
+
+	// Verify behavior settings are present and defaulted to false
+	cfg := loadConfigForTest(t, configPath)
+
+	if cfg.Behavior.RequireExplicitVaultUpgrade == nil {
+		t.Errorf("expected require_explicit_vault_upgrade to be set")
+	} else if *cfg.Behavior.RequireExplicitVaultUpgrade != false {
+		t.Errorf("expected require_explicit_vault_upgrade=false, got %v", *cfg.Behavior.RequireExplicitVaultUpgrade)
+	}
+
+	if cfg.Behavior.RestrictToConfiguredVaults == nil {
+		t.Errorf("expected restrict_to_configured_vaults to be set")
+	} else if *cfg.Behavior.RestrictToConfiguredVaults != false {
+		t.Errorf("expected restrict_to_configured_vaults=false, got %v", *cfg.Behavior.RestrictToConfiguredVaults)
+	}
+}
+
+func TestInitConfig_BehaviorCommentsExist(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+
+	// Run init config
+	_, stderr, err := runCmd("init", "config", "-c", configPath)
+	if err != nil {
+		t.Fatalf("init config failed: %v\nSTDERR: %s", err, stderr)
+	}
+
+	// Read raw config file to check for comments
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("failed to read config file: %v", err)
+	}
+	content := string(data)
+
+	// Verify comments are present
+	expectedComments := []string{
+		"# Behavior settings control how dotsecenv handles edge cases",
+		"# Prevent automatic vault format upgrades",
+		"# Ignore CLI -v flags",
+		"# 'PATH' resolves gpg from the system PATH at runtime.",
+	}
+
+	for _, comment := range expectedComments {
+		if !strings.Contains(content, comment) {
+			t.Errorf("expected config to contain comment %q", comment)
+		}
+	}
+}
+
+func TestInitConfig_NoStrictFieldInOutput(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+
+	// Run init config
+	_, stderr, err := runCmd("init", "config", "-c", configPath)
+	if err != nil {
+		t.Fatalf("init config failed: %v\nSTDERR: %s", err, stderr)
+	}
+}
+
+func TestInitConfig_DefaultLoginIsNil(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+
+	// Run init config without --login flag
+	_, stderr, err := runCmd("init", "config", "-c", configPath)
+	if err != nil {
+		t.Fatalf("init config failed: %v\nSTDERR: %s", err, stderr)
+	}
+
+	// Verify login section is absent until the user runs `dotsecenv login`.
+	cfg := loadConfigForTest(t, configPath)
+	if cfg.Login != nil {
+		t.Errorf("expected login section to be absent by default, got %+v", *cfg.Login)
+	}
+}
+
+func TestInitConfig_DefaultsGPGProgramToPATH(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+
+	// Run init config with no GPG-related flags.
+	_, stderr, err := runCmd("init", "config", "-c", configPath)
+	if err != nil {
+		t.Fatalf("init config failed: %v\nSTDERR: %s", err, stderr)
+	}
+
+	// Verify gpg.program is the literal "PATH" sentinel.
+	cfg := loadConfigForTest(t, configPath)
+	if cfg.GPG.Program != "PATH" {
+		t.Errorf("expected gpg.program=%q, got %q", "PATH", cfg.GPG.Program)
+	}
+
+	// Verify stderr surfaces the runtime-resolution intent.
+	if !strings.Contains(stderr, "Using GPG program: PATH (resolved at runtime)") {
+		t.Errorf("expected stderr to mention runtime PATH resolution, got: %s", stderr)
+	}
+}
+
+func TestInitConfig_GPGProgram(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+
+	customGPGPath := "/custom/path/to/gpg"
+
+	// Run init config with --gpg-program
+	_, stderr, err := runCmd("init", "config", "-c", configPath, "--gpg-program", customGPGPath)
+	if err != nil {
+		t.Fatalf("init config --gpg-program failed: %v\nSTDERR: %s", err, stderr)
+	}
+
+	// Verify gpg.program is set to the custom path
+	cfg := loadConfigForTest(t, configPath)
+	if cfg.GPG.Program != customGPGPath {
+		t.Errorf("expected gpg.program=%q, got %q", customGPGPath, cfg.GPG.Program)
+	}
+}
+
+func TestInitConfig_ConfigAlreadyExists(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+
+	// Create a config file first
+	_, _, err := runCmd("init", "config", "-c", configPath)
+	if err != nil {
+		t.Fatalf("first init config failed: %v", err)
+	}
+
+	// Try to init again (should fail)
+	_, stderr, err := runCmd("init", "config", "-c", configPath)
+	if err == nil {
+		t.Fatalf("expected second init config to fail, but it succeeded")
+	}
+
+	// Verify error message
+	if !strings.Contains(stderr, "already exists") {
+		t.Errorf("expected 'already exists' error message, got: %s", stderr)
+	}
+}
+
+func TestInitConfig_WithVaultPaths(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	vaultPath1 := filepath.Join(tmpDir, "vault1.yaml")
+	vaultPath2 := filepath.Join(tmpDir, "vault2.yaml")
+
+	// Run init config with -v flags
+	_, stderr, err := runCmd("init", "config", "-c", configPath, "-v", vaultPath1, "-v", vaultPath2)
+	if err != nil {
+		t.Fatalf("init config with vaults failed: %v\nSTDERR: %s", err, stderr)
+	}
+
+	// Verify vault paths are in config
+	cfg := loadConfigForTest(t, configPath)
+	if len(cfg.Vault) != 2 {
+		t.Errorf("expected 2 vaults, got %d", len(cfg.Vault))
+	}
+
+	found1, found2 := false, false
+	for _, v := range cfg.Vault {
+		if v == vaultPath1 {
+			found1 = true
+		}
+		if v == vaultPath2 {
+			found2 = true
+		}
+	}
+	if !found1 {
+		t.Errorf("expected vault path %q in config", vaultPath1)
+	}
+	if !found2 {
+		t.Errorf("expected vault path %q in config", vaultPath2)
+	}
+}
+
+func TestInitConfig_AllFlagsCombined(t *testing.T) {
+	// Test flags that don't require GPG operations (--login tested separately in e2e)
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	vaultPath := filepath.Join(tmpDir, "vault.yaml")
+	customGPGPath := "/usr/local/bin/gpg"
+
+	// Run init config with flags (excluding --login which requires real GPG)
+	_, stderr, err := runCmd("init", "config",
+		"-c", configPath,
+		"-v", vaultPath,
+		"--gpg-program", customGPGPath,
+	)
+	if err != nil {
+		t.Fatalf("init config with flags failed: %v\nSTDERR: %s", err, stderr)
+	}
+
+	// Verify settings
+	cfg := loadConfigForTest(t, configPath)
+
+	if cfg.GPG.Program != customGPGPath {
+		t.Errorf("expected gpg.program=%q, got %q", customGPGPath, cfg.GPG.Program)
+	}
+	if len(cfg.Vault) != 1 || cfg.Vault[0] != vaultPath {
+		t.Errorf("expected vault=[%q], got %v", vaultPath, cfg.Vault)
+	}
+
+	// Verify behavior section exists with defaults
+	if cfg.Behavior.RequireExplicitVaultUpgrade == nil || *cfg.Behavior.RequireExplicitVaultUpgrade != false {
+		t.Errorf("expected require_explicit_vault_upgrade=false")
+	}
+}
+
+func TestInitConfig_HasDefaultAlgorithms(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+
+	// Run init config
+	_, stderr, err := runCmd("init", "config", "-c", configPath)
+	if err != nil {
+		t.Fatalf("init config failed: %v\nSTDERR: %s", err, stderr)
+	}
+
+	// Verify FIPS-compliant algorithms are present
+	cfg := loadConfigForTest(t, configPath)
+	if len(cfg.ApprovedAlgorithms) == 0 {
+		t.Errorf("expected approved_algorithms to be set")
+	}
+
+	// Check for expected algorithms (RSA, ECC, EdDSA)
+	hasRSA, hasECC, hasEdDSA := false, false, false
+	for _, alg := range cfg.ApprovedAlgorithms {
+		switch alg.Algo {
+		case "RSA":
+			hasRSA = true
+			if alg.MinBits < 2048 {
+				t.Errorf("RSA min_bits should be >= 2048, got %d", alg.MinBits)
+			}
+		case "ECC":
+			hasECC = true
+		case "EdDSA":
+			hasEdDSA = true
+		}
+	}
+	if !hasRSA {
+		t.Errorf("expected RSA in approved_algorithms")
+	}
+	if !hasECC {
+		t.Errorf("expected ECC in approved_algorithms")
+	}
+	if !hasEdDSA {
+		t.Errorf("expected EdDSA in approved_algorithms")
+	}
+}
+
+// writeTestConfig writes a minimal config file with the given vault paths
+func writeTestConfig(t *testing.T, configPath string, vaultPaths []string) {
+	t.Helper()
+	var vaultYAML string
+	for _, v := range vaultPaths {
+		vaultYAML += fmt.Sprintf("  - %s\n", v)
+	}
+	content := fmt.Sprintf(`approved_algorithms:
+  - algo: RSA
+    min_bits: 2048
+vault:
+%sgpg:
+  program: PATH
+`, vaultYAML)
+	if err := os.WriteFile(configPath, []byte(content), 0600); err != nil {
+		t.Fatalf("failed to write config: %v", err)
+	}
+}
+
+func TestInitVault_WithIndex(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	vault1Path := filepath.Join(tmpDir, "vault1.dsv")
+	vault2Path := filepath.Join(tmpDir, "vault2.dsv")
+
+	writeTestConfig(t, configPath, []string{vault1Path, vault2Path})
+
+	// Init vault using index 1 (should resolve to vault1Path)
+	_, stderr, err := runCmd("init", "vault", "-c", configPath, "-v", "1")
+	if err != nil {
+		t.Fatalf("init vault -v 1 failed: %v\nSTDERR: %s", err, stderr)
+	}
+
+	// Verify vault was created at the config path, not a file named "1"
+	if _, statErr := os.Stat(vault1Path); os.IsNotExist(statErr) {
+		t.Errorf("expected vault file at %s, but it does not exist", vault1Path)
+	}
+	if _, statErr := os.Stat(filepath.Join(tmpDir, "1")); statErr == nil {
+		t.Errorf("found file named '1' — index was not resolved to config path")
+	}
+
+	// Verify stderr mentions the resolved path
+	if !strings.Contains(stderr, vault1Path) {
+		t.Errorf("expected stderr to reference %s, got: %s", vault1Path, stderr)
+	}
+}
+
+func TestInitVault_WithIndex_SecondVault(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	vault1Path := filepath.Join(tmpDir, "vault1.dsv")
+	vault2Path := filepath.Join(tmpDir, "vault2.dsv")
+
+	writeTestConfig(t, configPath, []string{vault1Path, vault2Path})
+
+	// Init vault using index 2 (should resolve to vault2Path)
+	_, stderr, err := runCmd("init", "vault", "-c", configPath, "-v", "2")
+	if err != nil {
+		t.Fatalf("init vault -v 2 failed: %v\nSTDERR: %s", err, stderr)
+	}
+
+	// Verify vault was created at vault2Path
+	if _, statErr := os.Stat(vault2Path); os.IsNotExist(statErr) {
+		t.Errorf("expected vault file at %s, but it does not exist", vault2Path)
+	}
+	// vault1 should NOT have been created
+	if _, statErr := os.Stat(vault1Path); statErr == nil {
+		t.Errorf("vault1 should not have been created when initializing index 2")
+	}
+}
+
+func TestInitVault_InvalidIndex(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	vault1Path := filepath.Join(tmpDir, "vault1.dsv")
+
+	writeTestConfig(t, configPath, []string{vault1Path})
+
+	// Index 99 exceeds configured vaults (only 1)
+	_, stderr, err := runCmd("init", "vault", "-c", configPath, "-v", "99")
+	if err == nil {
+		t.Fatal("expected error for out-of-range vault index, but command succeeded")
+	}
+
+	if !strings.Contains(stderr, "exceeds number of configured vaults") {
+		t.Errorf("expected 'exceeds number of configured vaults' error, got: %s", stderr)
+	}
+}
+
+func TestInitVault_ZeroIndex(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	vault1Path := filepath.Join(tmpDir, "vault1.dsv")
+
+	writeTestConfig(t, configPath, []string{vault1Path})
+
+	// Index 0 is invalid (1-based indexing)
+	_, stderr, err := runCmd("init", "vault", "-c", configPath, "-v", "0")
+	if err == nil {
+		t.Fatal("expected error for zero vault index, but command succeeded")
+	}
+
+	if !strings.Contains(stderr, "index") {
+		t.Errorf("expected index-related error, got: %s", stderr)
+	}
+}
+
+func TestInitVault_PathStillWorks(t *testing.T) {
+	tmpDir := t.TempDir()
+	vaultPath := filepath.Join(tmpDir, "explicit-vault.dsv")
+
+	// Init vault using explicit path (no config needed for path mode)
+	_, stderr, err := runCmd("init", "vault", "-v", vaultPath)
+	if err != nil {
+		t.Fatalf("init vault -v PATH failed: %v\nSTDERR: %s", err, stderr)
+	}
+
+	// Verify vault was created at the explicit path
+	if _, statErr := os.Stat(vaultPath); os.IsNotExist(statErr) {
+		t.Errorf("expected vault file at %s, but it does not exist", vaultPath)
+	}
+}

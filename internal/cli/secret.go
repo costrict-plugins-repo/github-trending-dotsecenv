@@ -1,0 +1,935 @@
+package cli
+
+import (
+	"bufio"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"slices"
+	"sort"
+	"strings"
+	"time"
+
+	"golang.org/x/term"
+
+	"github.com/dotsecenv/dotsecenv/pkg/dotsecenv/gpg"
+	"github.com/dotsecenv/dotsecenv/pkg/dotsecenv/output"
+	"github.com/dotsecenv/dotsecenv/pkg/dotsecenv/vault"
+)
+
+// SecretValueJSON is the JSON output structure for secret values.
+// AvailableTo, SignedBy and Deleted are populated when --all is used so the
+// JSON output is sufficient for auditing access control across versions.
+// Deleted marks a value that a later 'secret forget' in the same vault deleted.
+type SecretValueJSON struct {
+	AddedAt     time.Time   `json:"added_at"`
+	Value       interface{} `json:"value"`
+	Vault       string      `json:"vault,omitempty"`
+	AvailableTo []string    `json:"available_to,omitempty"`
+	SignedBy    string      `json:"signed_by,omitempty"`
+	Deleted     bool        `json:"deleted,omitempty"`
+}
+
+// allValuesLine formats one 'secret get --all' text line, marking deleted values.
+func allValuesLine(item SecretValueJSON) string {
+	marker := ""
+	if item.Deleted {
+		marker = " [deleted]"
+	}
+	return fmt.Sprintf("%s (%s)%s: %s\n", item.AddedAt.Format(time.RFC3339), item.Vault, marker, item.Value)
+}
+
+// historyValue is one value of a secret as 'secret get --all' lists it.
+type historyValue struct {
+	value     vault.SecretValue
+	vaultPath string
+	deleted   bool // a later deletion marker in the same vault deleted it
+}
+
+// secretHistory returns every value of a secret except its deletion markers,
+// oldest first, flagging the values that a later deletion marker deleted.
+func secretHistory(secretObj *vault.Secret, vaultPath string) []historyValue {
+	liveStart := secretObj.LiveStart()
+	var history []historyValue
+	for i, val := range secretObj.Values {
+		if val.Deleted {
+			continue
+		}
+		history = append(history, historyValue{value: val, vaultPath: vaultPath, deleted: i < liveStart})
+	}
+	return history
+}
+
+// decryptHistory decrypts history values in order. A value that fails to
+// decode or decrypt is skipped with a warning; a missing pinentry stops the walk.
+func (c *CLI) decryptHistory(history []historyValue, fp string) ([]SecretValueJSON, *Error) {
+	var decrypted []SecretValueJSON
+	for _, item := range history {
+		val := item.value
+
+		encryptedArmored, decodeErr := base64.StdEncoding.DecodeString(val.Value)
+		if decodeErr != nil {
+			c.Output().Warnf(output.CodeWarnDecodeFailure, "failed to decode value from %s: %v", val.AddedAt, decodeErr)
+			continue
+		}
+
+		// Let the GPG agent determine decryptability: the user may have a key
+		// in the agent that isn't the logged-in identity.
+		plaintext, decErr := c.gpgClient.DecryptWithAgent(encryptedArmored, fp)
+		if decErr != nil {
+			if errors.Is(decErr, gpg.ErrPinentryRequired) {
+				return nil, NewError(decErr.Error(), ExitGPGError)
+			}
+			c.Output().Warnf(output.CodeWarnDecryptFailure, "failed to decrypt value from %s: %v", val.AddedAt, decErr)
+			continue
+		}
+		decrypted = append(decrypted, SecretValueJSON{
+			AddedAt:     val.AddedAt,
+			Value:       smartJSONValue(string(plaintext)),
+			Vault:       item.vaultPath,
+			AvailableTo: val.AvailableTo,
+			SignedBy:    val.SignedBy,
+			Deleted:     item.deleted,
+		})
+	}
+	return decrypted, nil
+}
+
+// secretDeletedEverywhere reports whether some vault holds the secret and every
+// vault holding it has deleted it.
+func (c *CLI) secretDeletedEverywhere(key string) bool {
+	idx := c.vaultResolver.FindSecretVaultIndex(key)
+	if idx < 0 {
+		return false
+	}
+	secretObj := c.vaultResolver.GetSecretByKeyFromVault(idx, key)
+	return secretObj != nil && secretObj.IsDeleted()
+}
+
+// accessDeniedMessage builds the error message for a secret that exists in a
+// vault but whose value cannot be read by the given identity. Kept distinct
+// from the not-found message so callers can tell the two cases apart.
+func accessDeniedMessage(secretKey, fp string) string {
+	return fmt.Sprintf("access denied: secret '%s' exists but your identity (%s) has no access to it; ask someone with access to run: dotsecenv secret share %s %s", secretKey, fp, secretKey, fp)
+}
+
+// smartJSONValue returns a json.RawMessage if the value is a JSON object or array,
+// otherwise returns the plain string. This avoids double-escaping stored JSON.
+func smartJSONValue(s string) interface{} {
+	if len(s) > 0 && (s[0] == '{' || s[0] == '[') && json.Valid([]byte(s)) {
+		return json.RawMessage(s)
+	}
+	return s
+}
+
+// SecretPut stores a secret in the vault.
+// If preReadValue is non-empty, it's used as the secret value (for piped input read before vault lock).
+// If preReadValue is empty, the secret is read from stdin (interactive TTY mode).
+// StoreShareMode controls what SecretPut does when the secret being
+// overwritten is shared with other identities.
+type StoreShareMode int
+
+const (
+	// StoreSharePrompt warns that the new value stays shared and asks for
+	// confirmation when a terminal is available. This is the default.
+	StoreSharePrompt StoreShareMode = iota
+	// StoreShareAlways keeps the recipient set without warning (--share).
+	StoreShareAlways
+	// StoreShareNever encrypts only to the storer's identity (--no-share).
+	StoreShareNever
+)
+
+func (c *CLI) SecretPut(secretKeyArg, vaultPath string, fromIndex int, preReadValue string, shareMode StoreShareMode) *Error {
+	secretKey, normErr := vault.NormalizeSecretKey(secretKeyArg)
+	if normErr != nil {
+		return NewError(vault.FormatSecretKeyError(normErr), ExitValidationError)
+	}
+
+	fp, err := c.checkFingerprintRequired("secret store")
+	if err != nil {
+		return err
+	}
+
+	targetIndex, resolveErr := c.resolveWritableVaultIndex(vaultPath, fromIndex)
+	if resolveErr != nil {
+		return resolveErr
+	}
+
+	// The vault must already exist before storing a secret. 'identity add' may
+	// lazily create or populate a vault, but 'secret store' must not. Fail early
+	// when the target vault did not load (its file is missing) so the misleading
+	// identity auto-add warnings never print.
+	targetAvailable := false
+	for _, v := range c.vaultResolver.GetAvailableVaultPathsWithIndices() {
+		if v.Index == targetIndex {
+			targetAvailable = true
+			break
+		}
+	}
+	if !targetAvailable {
+		requested := fromIndex
+		if requested <= 0 {
+			requested = targetIndex + 1
+		}
+		return NewError(fmt.Sprintf("vault %d does not exist; run 'dotsecenv init vault -v %d' first", requested, requested), ExitVaultError)
+	}
+
+	if ensureErr := c.ensureIdentityInVault(fp, targetIndex); ensureErr != nil {
+		return ensureErr
+	}
+
+	identity := c.vaultResolver.GetIdentityByFingerprint(fp)
+	if identity == nil {
+		return NewError(fmt.Sprintf("identity not found in vault: %s", fp), ExitAccessDenied)
+	}
+
+	// Check if secret exists and if we have access to the latest value.
+	// When overwriting, the latest value's recipient set carries forward to the
+	// new entry: rotating a shared secret must not silently narrow access to
+	// just the storer. Narrowing the set is 'secret revoke'. A deleted secret is
+	// stored as a new one: any identity may store it, encrypted only to itself.
+	recipients := []string{fp}
+	existingSecret := c.vaultResolver.GetSecretByKeyFromVault(targetIndex, secretKey)
+	if existingSecret != nil && len(existingSecret.Values) > 0 && !existingSecret.IsDeleted() {
+		latestValue := existingSecret.Values[len(existingSecret.Values)-1]
+		if !slices.Contains(latestValue.AvailableTo, fp) {
+			return NewError(fmt.Sprintf("access denied: you do not have access to the latest value of secret '%s'", secretKey), ExitAccessDenied)
+		}
+		recipients = make([]string, len(latestValue.AvailableTo))
+		copy(recipients, latestValue.AvailableTo)
+		sort.Strings(recipients)
+	}
+
+	// Recipients other than the storer: the identities a re-store keeps sharing with.
+	others := make([]string, 0, len(recipients))
+	for _, recipientFP := range recipients {
+		if recipientFP != fp {
+			others = append(others, recipientFP)
+		}
+	}
+	if len(others) > 0 {
+		switch shareMode {
+		case StoreShareNever:
+			recipients = []string{fp}
+		case StoreShareAlways:
+			// Keep the carried-forward set without warning.
+		default:
+			if confirmErr := c.confirmSharedStore(secretKey, others); confirmErr != nil {
+				return confirmErr
+			}
+		}
+	}
+
+	recipientPublicKeys := make([]string, 0, len(recipients))
+	for _, recipientFP := range recipients {
+		recipientIdentity := c.vaultResolver.GetIdentityByFingerprint(recipientFP)
+		if recipientIdentity == nil {
+			return NewError(fmt.Sprintf("recipient identity not found: %s", recipientFP), ExitVaultError)
+		}
+		recipientPublicKeys = append(recipientPublicKeys, recipientIdentity.PublicKey)
+	}
+
+	var secretValue string
+	if preReadValue != "" {
+		// Use pre-read value (from piped stdin read before vault lock acquisition)
+		secretValue = preReadValue
+	} else {
+		// Read from stdin (TTY interactive mode)
+		isTTY := false
+		if f, ok := c.stdin.(*os.File); ok {
+			isTTY = term.IsTerminal(int(f.Fd()))
+		}
+
+		if isTTY {
+			_, _ = fmt.Fprintf(c.output.Stderr(), "Enter secret value (input will be redacted): ")
+		}
+		var readErr error
+		secretValue, readErr = c.readSecretFromStdin()
+		if readErr != nil {
+			return NewError(fmt.Sprintf("failed to read secret: %v", readErr), ExitGeneralError)
+		}
+	}
+
+	encryptedArmored, encErr := c.gpgClient.EncryptToRecipients(
+		[]byte(secretValue),
+		recipientPublicKeys,
+		nil,
+	)
+	if encErr != nil {
+		return NewError(fmt.Sprintf("failed to encrypt secret: %v", encErr), ExitGeneralError)
+	}
+
+	encryptedBase64 := base64.StdEncoding.EncodeToString([]byte(encryptedArmored))
+	now := time.Now().UTC()
+
+	// Build secret struct first (without hash/signature)
+	newSecret := vault.Secret{
+		AddedAt:  now,
+		Key:      secretKey,
+		SignedBy: fp,
+		Values:   []vault.SecretValue{},
+	}
+
+	// Compute hash using shared function
+	secretHash := vault.ComputeSecretHash(&newSecret, identity.AlgorithmBits)
+	secretSig, sigErr := c.gpgClient.SignDataWithAgent(fp, []byte(secretHash))
+	if sigErr != nil {
+		return newGPGError("failed to sign secret", sigErr, ExitGeneralError)
+	}
+	newSecret.Hash = secretHash
+	newSecret.Signature = secretSig
+
+	// Build secret value struct (without hash/signature)
+	newValue := vault.SecretValue{
+		AddedAt:     now,
+		AvailableTo: recipients,
+		SignedBy:    fp,
+		Value:       encryptedBase64,
+		Deleted:     false,
+	}
+
+	// Compute value hash using shared function
+	valueHash := vault.ComputeSecretValueHash(&newValue, secretKey, identity.AlgorithmBits)
+	valueSig, valueSigErr := c.gpgClient.SignDataWithAgent(fp, []byte(valueHash))
+	if valueSigErr != nil {
+		return newGPGError("failed to sign secret value", valueSigErr, ExitGeneralError)
+	}
+	newValue.Hash = valueHash
+	newValue.Signature = valueSig
+
+	newSecret.Values = []vault.SecretValue{newValue}
+
+	if err := c.vaultResolver.AddSecret(newSecret, targetIndex); err != nil {
+		return NewError(fmt.Sprintf("failed to add secret: %v", err), ExitVaultError)
+	}
+
+	if saveErr := c.vaultResolver.SaveVault(targetIndex); saveErr != nil {
+		return NewError(fmt.Sprintf("failed to save vault: %v", saveErr), ExitVaultError)
+	}
+
+	_, _ = fmt.Fprintf(c.output.Stdout(), "Secret '%s' stored successfully\n", secretKey)
+	return nil
+}
+
+// confirmSharedStore warns that re-storing a shared secret keeps its recipient
+// set and, when a terminal is available, asks for confirmation. Without a
+// terminal it proceeds after the warning so piped and CI stores keep working.
+func (c *CLI) confirmSharedStore(secretKey string, others []string) *Error {
+	stderr := c.output.Stderr()
+	_, _ = fmt.Fprintf(stderr, "warning: secret '%s' is shared; the new value stays readable by:\n", secretKey)
+	for _, otherFP := range others {
+		label := otherFP
+		if id := c.vaultResolver.GetIdentityByFingerprint(otherFP); id != nil && id.UID != "" {
+			label = fmt.Sprintf("%s (%s)", otherFP, id.UID)
+		}
+		_, _ = fmt.Fprintf(stderr, "  - %s\n", label)
+	}
+
+	hasTTY := c.hasTTY
+	if hasTTY == nil {
+		hasTTY = defaultHasTTY
+	}
+	if !hasTTY() {
+		_, _ = fmt.Fprintf(stderr, "warning: no terminal to confirm; keeping the recipient set (--share silences this warning, --no-share stores only for yourself)\n")
+		return nil
+	}
+
+	promptConfirm := c.promptConfirm
+	if promptConfirm == nil {
+		promptConfirm = PromptConfirm
+	}
+	confirmed, promptErr := promptConfirm("Keep sharing the new value with them?", stderr)
+	if promptErr != nil {
+		return promptErr
+	}
+	if !confirmed {
+		return NewError("store cancelled; re-run with --share to keep the recipient set or --no-share to store only for yourself", ExitGeneralError)
+	}
+	return nil
+}
+
+// SecretForget marks a secret as deleted by adding a deletion marker value.
+// The deletion marker has deleted=true and an empty available_to list.
+func (c *CLI) SecretForget(secretKeyArg, vaultPath string, fromIndex int, ignoreNotFound bool) *Error {
+	secretKey, normErr := vault.NormalizeSecretKey(secretKeyArg)
+	if normErr != nil {
+		return NewError(vault.FormatSecretKeyError(normErr), ExitValidationError)
+	}
+
+	fp, err := c.checkFingerprintRequired("secret forget")
+	if err != nil {
+		return err
+	}
+
+	targetIndex, resolveErr := c.resolveWritableVaultIndex(vaultPath, fromIndex)
+	if resolveErr != nil {
+		return resolveErr
+	}
+
+	existingSecret := c.vaultResolver.GetSecretByKeyFromVault(targetIndex, secretKey)
+	if existingSecret == nil {
+		if ignoreNotFound {
+			return nil
+		}
+		return NewError(fmt.Sprintf("secret '%s' not found in vault", secretKey), ExitVaultError)
+	}
+
+	if len(existingSecret.Values) == 0 {
+		if ignoreNotFound {
+			return nil
+		}
+		return NewError(fmt.Sprintf("secret '%s' has no values", secretKey), ExitVaultError)
+	}
+
+	// Check if already deleted
+	latestValue := existingSecret.Values[len(existingSecret.Values)-1]
+	if latestValue.Deleted {
+		if ignoreNotFound {
+			return nil
+		}
+		return NewError(fmt.Sprintf("secret '%s' is already deleted", secretKey), ExitGeneralError)
+	}
+
+	// Check if user has access to the latest value
+	if !slices.Contains(latestValue.AvailableTo, fp) {
+		return NewError(fmt.Sprintf("access denied: you do not have access to the latest value of secret '%s'", secretKey), ExitAccessDenied)
+	}
+
+	identity := c.vaultResolver.GetIdentityByFingerprint(fp)
+	if identity == nil {
+		return NewError(fmt.Sprintf("identity not found in vault: %s", fp), ExitAccessDenied)
+	}
+
+	now := time.Now().UTC()
+
+	// Create deletion marker value (without hash/signature first)
+	deletionValue := vault.SecretValue{
+		AddedAt:     now,
+		AvailableTo: []string{}, // Empty list - no one can access a deleted secret
+		Deleted:     true,
+		SignedBy:    fp,
+		Value:       "", // No encrypted value for deletion marker
+	}
+
+	// Compute hash using shared function
+	valueHash := vault.ComputeSecretValueHash(&deletionValue, secretKey, identity.AlgorithmBits)
+	valueSig, valueSigErr := c.gpgClient.SignDataWithAgent(fp, []byte(valueHash))
+	if valueSigErr != nil {
+		return newGPGError("failed to sign deletion marker", valueSigErr, ExitGeneralError)
+	}
+	deletionValue.Hash = valueHash
+	deletionValue.Signature = valueSig
+
+	// Create a secret with just the deletion value to add
+	deletionSecret := vault.Secret{
+		AddedAt:   existingSecret.AddedAt,
+		Hash:      existingSecret.Hash,
+		Key:       secretKey,
+		Signature: existingSecret.Signature,
+		SignedBy:  existingSecret.SignedBy,
+		Values:    []vault.SecretValue{deletionValue},
+	}
+
+	if err := c.vaultResolver.AddSecret(deletionSecret, targetIndex); err != nil {
+		return NewError(fmt.Sprintf("failed to add deletion marker: %v", err), ExitVaultError)
+	}
+
+	if saveErr := c.vaultResolver.SaveVault(targetIndex); saveErr != nil {
+		return NewError(fmt.Sprintf("failed to save vault: %v", saveErr), ExitVaultError)
+	}
+
+	_, _ = fmt.Fprintf(c.output.Stdout(), "Secret '%s' marked as deleted\n", secretKey)
+	return nil
+}
+
+// SecretGet retrieves a secret from the vault.
+// If the user cannot access the latest value, falls back to older accessible values with a warning.
+func (c *CLI) SecretGet(secretKey string, all bool, last bool, jsonOutput bool, vaultPath string, fromIndex int) *Error {
+	// Validate secret key format
+	if _, err := vault.NormalizeSecretKey(secretKey); err != nil {
+		return NewError(vault.FormatSecretKeyError(err), ExitValidationError)
+	}
+
+	fp, err := c.checkFingerprintRequired("secret get")
+	if err != nil {
+		return err
+	}
+
+	// Warn when decrypting without a controlling terminal (cron, CI, Docker without -t, etc.).
+	// We check /dev/tty instead of stdout's IsTerminal() because the shell plugin invokes
+	// `dotsecenv secret get` via command substitution $(...), which makes stdout a pipe even
+	// though the user is sitting at an interactive terminal.
+	hasTTY := c.hasTTY
+	if hasTTY == nil {
+		hasTTY = defaultHasTTY
+	}
+	if !hasTTY() {
+		c.Output().Warnf(output.CodeWarnGeneric, "decrypting in non-interactive terminal; for better security, configure GPG to require passphrase entry (https://dotsecenv.com/concepts/threat-model/#automated-secret-exfiltration)")
+	}
+
+	// Handle --last + -v combination - always error (conflicting flags)
+	if last && (vaultPath != "" || fromIndex != 0) {
+		vaultPaths := c.vaultResolver.GetVaultPaths()
+		var targetDesc string
+		if vaultPath != "" {
+			targetDesc = vaultPath
+		} else if fromIndex > 0 && fromIndex <= len(vaultPaths) {
+			targetDesc = fmt.Sprintf("vault %d (%s)", fromIndex, vaultPaths[fromIndex-1])
+		} else {
+			targetDesc = fmt.Sprintf("vault %d", fromIndex)
+		}
+		return NewError(fmt.Sprintf("--last and -v cannot be used together; omit -v to search all vaults or remove --last to use %s", targetDesc), ExitGeneralError)
+	}
+
+	targetIndex := -1
+
+	if vaultPath != "" {
+		expandedPath := vault.ExpandPath(vaultPath)
+		// Check if in config
+		loadedPaths := c.vaultResolver.GetVaultPaths()
+		found := false
+		for i, p := range loadedPaths {
+			if vault.ExpandPath(p) == expandedPath {
+				targetIndex = i
+				found = true
+				break
+			}
+		}
+		if !found {
+			// Check if file exists for better error message
+			if _, err := os.Stat(expandedPath); err != nil {
+				return NewError(fmt.Sprintf("vault file does not exist: %s", expandedPath), ExitVaultError)
+			}
+			return NewError(fmt.Sprintf("vault path '%s' not found in resolver", expandedPath), ExitVaultError)
+		}
+	} else if fromIndex != 0 {
+		configEntries := c.vaultResolver.GetConfig().Entries
+		if fromIndex <= 0 || fromIndex > len(configEntries) {
+			return NewError(fmt.Sprintf("-v index must be a positive integer between 1 and %d", len(configEntries)), ExitGeneralError)
+		}
+		targetIndex = fromIndex - 1
+	}
+
+	// Get secret based on mode
+	if targetIndex != -1 {
+		// Single vault mode
+		return c.vaultGetFromIndex(secretKey, targetIndex, all, jsonOutput, fp)
+	}
+
+	if last {
+		return c.vaultGetLastFromAllVaults(secretKey, jsonOutput, fp)
+	}
+
+	var decryptedValues []string
+	var decryptedValuesWithTime []SecretValueJSON
+	var secret *vault.SecretValue
+	var secretVaultPath string
+
+	if all {
+		// Collect the history of every vault, deleted values included.
+		var history []historyValue
+		for i, entry := range c.vaultResolver.GetConfig().Entries {
+			if secretObj := c.vaultResolver.GetSecretByKeyFromVault(i, secretKey); secretObj != nil {
+				history = append(history, secretHistory(secretObj, entry.Path)...)
+			}
+		}
+
+		if len(history) == 0 {
+			return NewError(fmt.Sprintf("secret '%s' not found in any vault", secretKey), ExitVaultError)
+		}
+
+		// Sort by AddedAt descending (newest first)
+		sort.Slice(history, func(i, j int) bool {
+			return history[i].value.AddedAt.After(history[j].value.AddedAt)
+		})
+
+		var histErr *Error
+		decryptedValuesWithTime, histErr = c.decryptHistory(history, fp)
+		if histErr != nil {
+			return histErr
+		}
+	} else {
+		// Default mode: return the value from the first vault, in configuration
+		// order, that holds the secret undeleted. Try fingerprint-matched access
+		// first (fast path), then fall back to the latest value and let the GPG
+		// agent determine decryptability: the user may have a different key in
+		// the agent than the logged-in identity.
+		var errGet error
+		var idx int
+		notGranted := false
+		secret, idx, errGet = c.vaultResolver.GetAccessibleSecretFromAnyVault(secretKey, fp)
+		if errGet != nil {
+			notGranted = true
+			secret, idx, errGet = c.vaultResolver.GetSecretFromAnyVault(secretKey, c.output.Stderr())
+			if errGet != nil {
+				if c.secretDeletedEverywhere(secretKey) {
+					_, _ = fmt.Fprintf(c.output.Stderr(), "error: secret '%s' has been deleted\n", secretKey)
+					return NewError(fmt.Sprintf("secret '%s' has been deleted", secretKey), ExitVaultError)
+				}
+				return NewError(fmt.Sprintf("secret '%s' not found in any vault", secretKey), ExitVaultError)
+			}
+		}
+
+		if entries := c.vaultResolver.GetConfig().Entries; idx < len(entries) {
+			secretVaultPath = entries[idx].Path
+		}
+
+		encryptedArmored, decodeErr := base64.StdEncoding.DecodeString(secret.Value)
+		if decodeErr != nil {
+			return NewError(fmt.Sprintf("failed to decode encrypted value: %v", decodeErr), ExitGeneralError)
+		}
+
+		plaintext, decErr := c.gpgClient.DecryptWithAgent(encryptedArmored, fp)
+		if decErr != nil {
+			if errors.Is(decErr, gpg.ErrPinentryRequired) {
+				return NewError(decErr.Error(), ExitGPGError)
+			}
+			if notGranted {
+				return NewError(accessDeniedMessage(secretKey, fp), ExitAccessDenied)
+			}
+			return newGPGError("failed to decrypt secret", decErr, ExitGPGError)
+		}
+		decryptedValues = append(decryptedValues, string(plaintext))
+	}
+
+	if jsonOutput {
+		encoder := json.NewEncoder(c.output.Stdout())
+		encoder.SetIndent("", "  ")
+
+		if all {
+			if err := encoder.Encode(decryptedValuesWithTime); err != nil {
+				return NewError(fmt.Sprintf("failed to encode json: %v", err), ExitGeneralError)
+			}
+		} else {
+			output := SecretValueJSON{
+				AddedAt: secret.AddedAt,
+				Value:   smartJSONValue(decryptedValues[0]),
+				Vault:   secretVaultPath,
+			}
+			if err := encoder.Encode(output); err != nil {
+				return NewError(fmt.Sprintf("failed to encode json: %v", err), ExitGeneralError)
+			}
+		}
+	} else {
+		if all {
+			for _, item := range decryptedValuesWithTime {
+				_, _ = fmt.Fprint(c.output.Stdout(), allValuesLine(item))
+			}
+		} else {
+			if len(decryptedValues) > 0 {
+				// Trim trailing newline to avoid double newline (echo adds one, we add one)
+				value := strings.TrimSuffix(decryptedValues[0], "\n")
+				_, _ = fmt.Fprintf(c.output.Stdout(), "%s\n", value)
+			}
+		}
+	}
+
+	return nil
+}
+
+// vaultGetFromIndex retrieves a secret from a specific vault index.
+// If the user cannot access the latest value, falls back to older accessible values with a warning.
+func (c *CLI) vaultGetFromIndex(key string, index int, all bool, jsonOutput bool, fp string) *Error {
+	secretObj := c.vaultResolver.GetSecretByKeyFromVault(index, key)
+	if secretObj == nil {
+		return NewError(fmt.Sprintf("secret '%s' not found in vault", key), ExitVaultError)
+	}
+
+	if len(secretObj.Values) == 0 {
+		return NewError(fmt.Sprintf("secret '%s' has no values", key), ExitVaultError)
+	}
+
+	entries := c.vaultResolver.GetConfig().Entries
+	var vaultPath string
+	if index < len(entries) {
+		vaultPath = entries[index].Path
+	}
+
+	var decryptedValues []string
+	var decryptedValuesWithTime []SecretValueJSON
+
+	if all {
+		// The vault's whole history, deleted values included, newest first.
+		history := secretHistory(secretObj, vaultPath)
+		slices.Reverse(history)
+		var histErr *Error
+		decryptedValuesWithTime, histErr = c.decryptHistory(history, fp)
+		if histErr != nil {
+			return histErr
+		}
+	} else {
+		if secretObj.IsDeleted() {
+			_, _ = fmt.Fprintf(c.output.Stderr(), "error: secret '%s' has been deleted\n", key)
+			return NewError(fmt.Sprintf("secret '%s' has been deleted", key), ExitVaultError)
+		}
+
+		// Use manager to get accessible value (supporting fallback)
+		manager := c.vaultResolver.GetVaultManager(index)
+		if manager == nil {
+			cfg := c.vaultResolver.GetConfig()
+			path := "unknown"
+			if index >= 0 && index < len(cfg.Entries) {
+				path = cfg.Entries[index].Path
+			}
+			return NewError(fmt.Sprintf("Vault %d (%s): not found", index+1, path), ExitVaultError)
+		}
+
+		// Try fingerprint-matched access first, fall back to latest value
+		// and let GPG agent determine if we can decrypt.
+		val := manager.GetAccessibleSecretValue(fp, key)
+		notGranted := val == nil
+		if val == nil {
+			val = &secretObj.Values[len(secretObj.Values)-1]
+		}
+
+		encryptedArmored, decodeErr := base64.StdEncoding.DecodeString(val.Value)
+		if decodeErr != nil {
+			return NewError(fmt.Sprintf("failed to decode encrypted value: %v", decodeErr), ExitGeneralError)
+		}
+
+		plaintext, decErr := c.gpgClient.DecryptWithAgent(encryptedArmored, fp)
+		if decErr != nil {
+			if errors.Is(decErr, gpg.ErrPinentryRequired) {
+				return NewError(decErr.Error(), ExitGPGError)
+			}
+			if notGranted {
+				return NewError(accessDeniedMessage(key, fp), ExitAccessDenied)
+			}
+			return newGPGError("failed to decrypt secret", decErr, ExitGPGError)
+		}
+		decryptedValues = append(decryptedValues, string(plaintext))
+		decryptedValuesWithTime = append(decryptedValuesWithTime, SecretValueJSON{
+			AddedAt: val.AddedAt,
+			Value:   smartJSONValue(string(plaintext)),
+			Vault:   vaultPath,
+		})
+	}
+
+	if len(decryptedValuesWithTime) == 0 {
+		return NewError(fmt.Sprintf("no accessible values for secret '%s'", key), ExitAccessDenied)
+	}
+
+	if jsonOutput {
+		encoder := json.NewEncoder(c.output.Stdout())
+		encoder.SetIndent("", "  ")
+
+		if all {
+			if err := encoder.Encode(decryptedValuesWithTime); err != nil {
+				return NewError(fmt.Sprintf("failed to encode json: %v", err), ExitGeneralError)
+			}
+		} else {
+			if err := encoder.Encode(decryptedValuesWithTime[0]); err != nil {
+				return NewError(fmt.Sprintf("failed to encode json: %v", err), ExitGeneralError)
+			}
+		}
+	} else {
+		if all {
+			for _, item := range decryptedValuesWithTime {
+				_, _ = fmt.Fprint(c.output.Stdout(), allValuesLine(item))
+			}
+		} else {
+			// Trim trailing newline to avoid double newline (echo adds one, we add one)
+			value := strings.TrimSuffix(decryptedValues[0], "\n")
+			_, _ = fmt.Fprintf(c.output.Stdout(), "%s\n", value)
+		}
+	}
+
+	return nil
+}
+
+// vaultGetLastFromAllVaults retrieves the most recent value (by added_at) across all vaults
+func (c *CLI) vaultGetLastFromAllVaults(key string, jsonOutput bool, fp string) *Error {
+	var mostRecentValue *vault.SecretValue
+	var mostRecentTime time.Time
+	var mostRecentVaultPath string
+	secretExists := false
+	secretDeleted := false
+
+	entries := c.vaultResolver.GetConfig().Entries
+
+	for i, entry := range entries {
+		secretObj := c.vaultResolver.GetSecretByKeyFromVault(i, key)
+		if secretObj == nil || len(secretObj.Values) == 0 {
+			continue
+		}
+
+		// Skip vaults where the secret is deleted
+		if secretObj.IsDeleted() {
+			secretDeleted = true
+			continue
+		}
+		secretExists = true
+
+		live := secretObj.LiveValues()
+		for j := range live {
+			val := &live[j]
+
+			hasAccess := false
+			for _, authorizedFp := range val.AvailableTo {
+				if authorizedFp == fp {
+					hasAccess = true
+					break
+				}
+			}
+			if !hasAccess {
+				continue
+			}
+
+			if mostRecentValue == nil || val.AddedAt.After(mostRecentTime) {
+				mostRecentValue = val
+				mostRecentTime = val.AddedAt
+				mostRecentVaultPath = entry.Path
+			}
+		}
+	}
+
+	if mostRecentValue == nil {
+		if secretExists {
+			return NewError(accessDeniedMessage(key, fp), ExitAccessDenied)
+		}
+		if secretDeleted {
+			return NewError(fmt.Sprintf("secret '%s' has been deleted", key), ExitVaultError)
+		}
+		return NewError(fmt.Sprintf("secret '%s' not found in any vault", key), ExitVaultError)
+	}
+
+	encryptedArmored, decodeErr := base64.StdEncoding.DecodeString(mostRecentValue.Value)
+	if decodeErr != nil {
+		return NewError(fmt.Sprintf("failed to decode encrypted value: %v", decodeErr), ExitGeneralError)
+	}
+
+	plaintext, decErr := c.gpgClient.DecryptWithAgent(encryptedArmored, fp)
+	if decErr != nil {
+		return newGPGError("failed to decrypt secret", decErr, ExitGPGError)
+	}
+
+	if jsonOutput {
+		encoder := json.NewEncoder(c.output.Stdout())
+		encoder.SetIndent("", "  ")
+		output := SecretValueJSON{
+			AddedAt: mostRecentValue.AddedAt,
+			Value:   smartJSONValue(string(plaintext)),
+			Vault:   mostRecentVaultPath,
+		}
+		if err := encoder.Encode(output); err != nil {
+			return NewError(fmt.Sprintf("failed to encode json: %v", err), ExitGeneralError)
+		}
+	} else {
+		_, _ = fmt.Fprintf(c.output.Stdout(), "%s\n", string(plaintext))
+	}
+
+	return nil
+}
+
+// readSecretFromStdin reads a secret from stdin.
+// If stdin is a TTY, it uses term.ReadPassword to hide the input.
+func (c *CLI) readSecretFromStdin() (string, error) {
+	// Check if stdin is a TTY - if so, use secure password reading
+	if f, ok := c.stdin.(*os.File); ok && term.IsTerminal(int(f.Fd())) {
+		password, err := term.ReadPassword(int(f.Fd()))
+		if err != nil {
+			return "", err
+		}
+		// Print newline since ReadPassword doesn't echo it
+		_, _ = fmt.Fprintln(c.output.Stderr())
+		return string(password), nil
+	}
+
+	// Non-TTY: read normally (e.g., piped input)
+	scanner := bufio.NewScanner(c.stdin)
+	if scanner.Scan() {
+		return scanner.Text(), nil
+	}
+	if err := scanner.Err(); err != nil {
+		return "", err
+	}
+	return "", fmt.Errorf("no input provided")
+}
+
+// SecretListJSON is the JSON output structure for secret list
+type SecretListJSON struct {
+	Key     string `json:"key"`
+	Vault   string `json:"vault,omitempty"`
+	Deleted bool   `json:"deleted,omitempty"`
+}
+
+// SecretList lists all secret keys from vaults.
+// If vaultPath is specified or fromIndex > 0, lists secrets only from that vault.
+// Otherwise, lists secrets from all vaults.
+func (c *CLI) SecretList(jsonOutput bool, vaultPath string, fromIndex int) *Error {
+	targetIndex := -1
+
+	// Resolve which vault(s) to list from
+	if vaultPath != "" {
+		expandedPath := vault.ExpandPath(vaultPath)
+		loadedPaths := c.vaultResolver.GetVaultPaths()
+		found := false
+		for i, p := range loadedPaths {
+			if vault.ExpandPath(p) == expandedPath {
+				targetIndex = i
+				found = true
+				break
+			}
+		}
+		if !found {
+			// Check if file exists for better error message
+			if _, err := os.Stat(expandedPath); err != nil {
+				return NewError(fmt.Sprintf("vault file does not exist: %s", expandedPath), ExitVaultError)
+			}
+			return NewError(fmt.Sprintf("vault path '%s' not found in resolver", expandedPath), ExitVaultError)
+		}
+	} else if fromIndex != 0 {
+		configEntries := c.vaultResolver.GetConfig().Entries
+		if fromIndex <= 0 || fromIndex > len(configEntries) {
+			return NewError(fmt.Sprintf("-v index must be a positive integer between 1 and %d", len(configEntries)), ExitGeneralError)
+		}
+		targetIndex = fromIndex - 1
+	}
+
+	// Get secret keys
+	var secrets []vault.SecretKeyInfo
+	if targetIndex >= 0 {
+		secrets = c.vaultResolver.ListSecretKeysFromVault(targetIndex)
+	} else {
+		secrets = c.vaultResolver.ListAllSecretKeys()
+	}
+
+	// Sort secrets by key
+	sort.Slice(secrets, func(i, j int) bool {
+		return secrets[i].Key < secrets[j].Key
+	})
+
+	// Output
+	if jsonOutput {
+		output := make([]SecretListJSON, 0, len(secrets))
+		for _, s := range secrets {
+			output = append(output, SecretListJSON{
+				Key:     s.Key,
+				Vault:   s.Vault,
+				Deleted: s.Deleted,
+			})
+		}
+
+		encoder := json.NewEncoder(c.output.Stdout())
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(output); err != nil {
+			return NewError(fmt.Sprintf("failed to encode json: %v", err), ExitGeneralError)
+		}
+	} else {
+		if len(secrets) == 0 {
+			_, _ = fmt.Fprintf(c.output.Stdout(), "No secrets found\n")
+		} else {
+			for _, s := range secrets {
+				if s.Deleted {
+					_, _ = fmt.Fprintf(c.output.Stdout(), "%s (deleted)\n", s.Key)
+				} else {
+					_, _ = fmt.Fprintf(c.output.Stdout(), "%s\n", s.Key)
+				}
+			}
+		}
+	}
+
+	return nil
+}

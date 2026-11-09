@@ -1,0 +1,20 @@
+# For this repo we DO NOT want to include any test vaults
+.dotsecenv
+
+# Binary
+bin/
+build/
+dist/
+
+# Docusaurus
+website/node_modules
+website/build
+website/.docusaurus
+website/.cache
+
+# Claude
+# A user-global ignore may exclude **/.claude/; re-include it here so the
+# shared project config and skills stay tracked.
+!.claude/
+.claude/settings.local.json
+.worktrees/
