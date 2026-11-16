@@ -1,0 +1,228 @@
+version: 2
+
+project_name: dotsecenv
+
+before:
+  hooks:
+    - go mod tidy
+    - make build completions docs man
+    - make plugin
+
+builds:
+  # All platforms use Go's native FIPS 140-3 module (no CGO required)
+  # See: https://go.dev/blog/fips140
+  - id: default
+    env:
+      - CGO_ENABLED=0
+      - GOFIPS140=v1.26.0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    binary: dotsecenv
+    main: ./cmd/dotsecenv
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
+
+archives:
+  - name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i386
+      {{- else }}{{ .Arch }}{{ end }}
+    files:
+      - LICENSE
+      - README.md
+      - src: build/man/man1/*
+        dst: man/man1
+        strip_parent: true
+      - src: build/completions/*
+        dst: completions
+        strip_parent: true
+      - contrib/*
+      - src: build/plugin/dotsecenv.plugin.zsh
+        dst: plugin/dotsecenv.plugin.zsh
+      - src: build/plugin/dotsecenv.plugin.bash
+        dst: plugin/dotsecenv.plugin.bash
+      - src: build/plugin/_dotsecenv_core.sh
+        dst: plugin/_dotsecenv_core.sh
+      - src: build/plugin/conf.d/dotsecenv.fish
+        dst: plugin/conf.d/dotsecenv.fish
+
+checksum:
+  name_template: 'checksums.txt'
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+
+# Homebrew configuration
+# https://goreleaser.com/customization/homebrew_casks/?h=homebrew_casks
+homebrew_casks:
+  - name: dotsecenv
+    commit_msg_template: "Cask update for {{ .ProjectName }} version {{ .Tag }}"
+    homepage: "https://dotsecenv.com"
+    description: "Safe environment secrets — encrypted at rest, ready to commit, easy to share."
+    dependencies:
+      - formula: gnupg
+    # Install the shell plugins (shipped inside the release archive under
+    # plugin/) to a stable path, mirroring the Linux packages'
+    # /usr/share/dotsecenv/plugin/. HOMEBREW_PREFIX interpolates at cask
+    # load time; artifact-declared files are removed on `brew uninstall`.
+    #
+    # The git credential helper needs a `binary` stanza, not an `artifact`:
+    # git resolves git-credential-* by searching PATH, and `binary` symlinks
+    # into HOMEBREW_PREFIX/bin, which brew relinks on upgrade. Without this the
+    # cask stages the helper into the version-scoped Caskroom and nothing puts
+    # it on PATH, so `credential.helper dotsecenv` never resolves.
+    custom_block: |
+      binary "contrib/git-credential-dotsecenv"
+      artifact "plugin/dotsecenv.plugin.zsh", target: "#{HOMEBREW_PREFIX}/share/dotsecenv/plugin/dotsecenv.plugin.zsh"
+      artifact "plugin/dotsecenv.plugin.bash", target: "#{HOMEBREW_PREFIX}/share/dotsecenv/plugin/dotsecenv.plugin.bash"
+      artifact "plugin/_dotsecenv_core.sh", target: "#{HOMEBREW_PREFIX}/share/dotsecenv/plugin/_dotsecenv_core.sh"
+      artifact "plugin/conf.d/dotsecenv.fish", target: "#{HOMEBREW_PREFIX}/share/dotsecenv/plugin/conf.d/dotsecenv.fish"
+    caveats: |
+        For bash completions, install bash-completion:
+          brew install bash-completion@2
+
+        To enable automatic .env/.secenv loading, add the plugin for your
+        shell to its config file:
+          zsh (~/.zshrc):
+            source "$(brew --prefix)/share/dotsecenv/plugin/dotsecenv.plugin.zsh"
+          bash (~/.bashrc):
+            source "$(brew --prefix)/share/dotsecenv/plugin/dotsecenv.plugin.bash"
+          fish (~/.config/fish/config.fish):
+            source (brew --prefix)/share/dotsecenv/plugin/conf.d/dotsecenv.fish
+
+        Details: https://dotsecenv.com/guides/shell-plugins/
+    manpages:
+      - man/man1/dotsecenv.1
+      - man/man1/dotsecenv-completion.1
+      - man/man1/dotsecenv-init.1
+      - man/man1/dotsecenv-init-config.1
+      - man/man1/dotsecenv-init-vault.1
+      - man/man1/dotsecenv-login.1
+      - man/man1/dotsecenv-secret.1
+      - man/man1/dotsecenv-secret-get.1
+      - man/man1/dotsecenv-secret-store.1
+      - man/man1/dotsecenv-secret-revoke.1
+      - man/man1/dotsecenv-secret-share.1
+      - man/man1/dotsecenv-validate.1
+      - man/man1/dotsecenv-vault.1
+      - man/man1/dotsecenv-vault-describe.1
+      - man/man1/dotsecenv-vault-doctor.1
+      - man/man1/dotsecenv-version.1
+    completions:
+      bash: completions/dotsecenv.bash
+      zsh: completions/dotsecenv.zsh
+      fish: completions/dotsecenv.fish
+    repository:
+      owner: dotsecenv
+      name: homebrew-tap
+      branch: main
+      token: "{{ .Env.GITHUB_ORG_TOKEN }}"
+
+nfpms:
+  - file_name_template: '{{ .ProjectName }}_{{ .Version }}_{{ .Arch }}'
+    description: "Safe environment secrets — encrypted at rest, ready to commit, easy to share."
+    homepage:  https://github.com/dotsecenv/dotsecenv
+    vendor: DotSecEnv Ltd.
+    maintainer: DotSecEnv <release@dotsecenv.com>
+    license: APACHE-2.0
+    formats:
+      - deb
+      - rpm
+      - archlinux
+    dependencies:
+      - gnupg
+    recommends:
+      # git-credential-dotsecenv needs jq for `store`. Recommends, not Depends:
+      # the helper is optional, so jq should not be forced on everyone who
+      # installs dotsecenv. apt and dnf both pull weak dependencies by default,
+      # so anyone who does not opt out gets a working helper. Arch has no nfpm
+      # mapping for this, so there it stays documentation-only.
+      - jq
+    suggests:
+      - bash-completion
+    rpm:
+      packager: DotSecEnv <release@dotsecenv.com>
+      signature:
+        key_file: "{{ .Env.GPG_KEY_FILE }}"
+    deb:
+      signature:
+        key_file: "{{ .Env.GPG_KEY_FILE }}"
+    archlinux:
+      packager: DotSecEnv <release@dotsecenv.com>
+    bindir: /usr/bin
+    section: default
+    contents:
+      - src: LICENSE
+        dst: /usr/share/doc/dotsecenv/LICENSE
+      - src: README.md
+        dst: /usr/share/doc/dotsecenv/README.md
+      - src: build/man/man1/*.1
+        dst: /usr/share/man/man1/
+      - src: build/completions/dotsecenv.bash
+        dst: /usr/share/bash-completion/completions/dotsecenv
+      - src: build/completions/dotsecenv.zsh
+        dst: /usr/share/zsh/site-functions/_dotsecenv
+      - src: build/completions/dotsecenv.fish
+        dst: /usr/share/fish/vendor_completions.d/dotsecenv.fish
+      - src: contrib/terraform-credentials-dotsecenv
+        dst: /usr/share/terraform/plugins/terraform-credentials-dotsecenv
+        file_info:
+          mode: 0755
+      # git resolves git-credential-* from PATH, so install into a PATH dir
+      - src: contrib/git-credential-dotsecenv
+        dst: /usr/bin/git-credential-dotsecenv
+        file_info:
+          mode: 0755
+      - src: build/plugin/dotsecenv.plugin.zsh
+        dst: /usr/share/dotsecenv/plugin/dotsecenv.plugin.zsh
+      - src: build/plugin/dotsecenv.plugin.bash
+        dst: /usr/share/dotsecenv/plugin/dotsecenv.plugin.bash
+      - src: build/plugin/_dotsecenv_core.sh
+        dst: /usr/share/dotsecenv/plugin/_dotsecenv_core.sh
+      - src: build/plugin/conf.d/dotsecenv.fish
+        dst: /usr/share/dotsecenv/plugin/conf.d/dotsecenv.fish
+
+sboms:
+  - disable: false
+
+# https://goreleaser.com/customization/sign/#usage
+signs:
+  - id: checksum 
+    artifacts: checksum
+    stdin: "{{ .Env.NFPM_PASSPHRASE }}"
+  - id: package
+    artifacts: package
+    stdin: "{{ .Env.NFPM_PASSPHRASE }}"
+    args:
+      - "--detach-sign"
+      - "${artifact}"
+  - id: archive
+    artifacts: archive
+    stdin: "{{ .Env.NFPM_PASSPHRASE }}"
+    args:
+      - "--detach-sign"
+      - "${artifact}"
+  - id: sbom
+    artifacts: sbom
+    stdin: "{{ .Env.NFPM_PASSPHRASE }}"
+    args:
+      - "--detach-sign"
+      - "${artifact}"
+
+# https://goreleaser.com/customization/binary_sign/
+binary_signs:
+  - stdin: "{{ .Env.NFPM_PASSPHRASE }}"  

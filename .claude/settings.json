@@ -1,0 +1,20 @@
+{
+  "enabledPlugins": {
+    "claude-blog@agricidaniel-blog": true,
+    "technical-docs@danielrosehill": true
+  },
+  "extraKnownMarketplaces": {
+    "agricidaniel-blog": {
+      "source": {
+        "source": "github",
+        "repo": "AgriciDaniel/claude-blog"
+      }
+    },
+    "danielrosehill": {
+      "source": {
+        "source": "github",
+        "repo": "danielrosehill/Claude-Code-Plugins"
+      }
+    }
+  }
+}

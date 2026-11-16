@@ -1,0 +1,50 @@
+# Follow these rules
+
+## Release new version
+
+- **Pre-release gate:** run the CLI reference drift check and resolve any drift before tagging — `bash .agents/skills/cli-reference-drift/check.sh` (see [.agents/skills/cli-reference-drift/SKILL.md](.agents/skills/cli-reference-drift/SKILL.md)). The website CLI reference (`website/src/content/docs/reference.mdx`) is hand-curated and must stay in sync with the binary.
+- **Changelog:** in the release PR, run `bash .agents/skills/changelog/assess.sh` to confirm every merged PR since the last tag is recorded, then stamp the `## Upcoming` section of `website/src/content/docs/changelog.mdx` to `vX.Y.Z` + date (see [.agents/skills/changelog/SKILL.md](.agents/skills/changelog/SKILL.md)).
+- **Agent plugin versions:** before tagging, run `uv run --script scripts/set-plugin-version.py X.Y.Z`, `uv run --script scripts/validate-agent-plugins.py X.Y.Z`, and `git diff --check`, then commit the synchronized `.claude-plugin/plugin.json` and `.codex-plugin/plugin.json` versions. The scripts have no third-party dependencies; `uv` supplies the Python runtime. The marketplace catalog version is independent.
+- When asked to release, use `rt git::release --major --sign --push vX.Y.Z` where X.Y.Z is the version to release
+- Then push the tag to the origin
+
+### Release signing key
+
+For initial release-signing setup or key replacement, run [`bash scripts/generate_release_key.sh`](scripts/generate_release_key.sh) from the repo root. It creates a signing-only RSA-4096 primary key with no subkeys and a two-year expiry in a temporary GPG keyring.
+
+The script prompts for a non-empty passphrase and prints ASCII-armored public and private keys before deleting its temporary keyring. Publish the public key at `https://get.dotsecenv.com/key.asc`, set the private key as release CI's `GPG_PRIVATE_KEY`, and set its passphrase as `GPG_PASSPHRASE`. This key signs releases; vault-decryption keys used in application CI have a separate role.
+
+## Satellite repositories (plugin, packages)
+
+`plugin/` and `packages/` in this monorepo are the **source of truth**. CI mirrors them to their standalone satellite repos (`dotsecenv/plugin`, `dotsecenv/packages`). Never edit the satellites directly and never accept PRs there; edits made on a satellite are overwritten by the next publish.
+
+The release workflow (`.github/workflows/release.yml`) mirrors each source directory to its satellite's `main` and adds a version tag. Run `Publish Satellites` (`.github/workflows/publish-satellites.yml`) from monorepo `main` for updates between releases; it publishes without a tag. Both use `releasetools/actions/signed-push`, and each commit body carries one `Source-Commit: <https://github.com/dotsecenv/dotsecenv/commit/SHA>` trailer.
+
+`releasetools/actions/verify-signed-push` checks a satellite commit through GitHub's REST API, with no checkout. GitHub must have signed it, `dotsecenv-automated-releases[bot]` must have authored it, its `Source-Commit` must name a commit on monorepo `main`, and its tree must equal that commit's `plugin/` or `packages/` tree. Given a release tag, it also requires the tag to be annotated, verified, and pointing at that commit. The `release tags` ruleset requires every `v*` tag to be signed and forbids moving or deleting one, so anyone with write access who signs a tag can cut a release.
+
+The packages satellite holds `packages/` exactly, so `packages/retracted.txt` is committed. After editing the `retract` block in `go.mod`, regenerate it with `./scripts/extract-retracted.sh go.mod > packages/retracted.txt`; `make lint` fails while the two disagree.
+
+Packages deployment starts only through `workflow_dispatch`. The release and ad-hoc workflows dispatch it after publishing, passing the source SHA and, on releases, the tag. The release App needs Actions write permission on `packages`. The satellite's `provenance` job runs the check with `permissions: {}` and no secrets; the jobs that use secrets depend on it, and the build checks out the verified satellite SHA. A manual rebuild with `keep_versions` leaves the source inputs empty and verifies whatever the HEAD trailer names. Anyone with write access to `dotsecenv/packages` can dispatch it.
+
+`Verify Satellite Drift` runs the same check on both satellites after each successful release, against the release's commit and tag.
+
+The org-scoped `GPG_PRIVATE_KEY` and `GPG_PASSPHRASE` are sign-only distribution credentials used by the monorepo and packages workflows. The plugin satellite requires neither. Workflow checks trust protected monorepo `main` and the pinned `verify-signed-push` release, and do not prevent a credential with workflow-editing access from replacing the satellite workflow itself.
+
+A bug reported on a satellite (e.g. `dotsecenv/plugin#29` about `conf.d/dotsecenv.fish`) is fixed here under `plugin/` with a matching `plugin/tests/` change, and reaches the satellite on the next publish. `plugin/AGENTS.md` states this in the satellite for anyone landing there. Reference satellite issues/PRs as `plugin#N` / `packages#N`. The plugin test suite is `make -C plugin test-plugins` (bash/zsh/fish).
+
+## Policy directory conventions
+
+- Policy fragments live at `/etc/dotsecenv/policy.d/*.yaml`, owned `root:root`, mode `0644` or stricter
+- Filename ordering matches Unix `*.d` convention (sudoers.d, systemd, nginx): files load lexically; for scalar policy fields in future phases, lexically-later fragments override earlier ones
+- Naming convention: `00-base, 50-team, 99-overrides`
+- For allow-list fields (Phase 1: `approved_algorithms`), filename order is irrelevant — fragments union
+- `policy.DefaultDir` in `pkg/dotsecenv/policy/policy.go` is exposed as a `var` (not `const`) so tests can override; **production code MUST NOT reassign it**
+- `policy validate` is meant to run in CI for ops repos shipping policy; exit codes are distinct per error category
+
+## Documentation hygiene
+
+When writing or editing user-facing prose (READMEs, recipes, tutorials, runbooks, guides, concept pages, code comments, CLI help strings, error messages):
+
+- Run the content through the `/humanizer` skill before committing. Scan for em-dash overuse, rule-of-three decoration, AI vocabulary (`delve`, `underscores`, `leverage`, `seamless`, `tapestry`, `robust`), copula avoidance, signposting ("Let me dive into…"), fragmented headers, and inline-header vertical lists (`**Bold:** restatement`).
+- Keep the focus on the tool. Do not prescribe company policy, comms channels, escalation paths, or org-specific workflow (on-call channels, security logs, "loop in legal", HR procedures). Document what dotsecenv does and how to use it; leave the org-side wrapping to the reader.
+- Match the terse, direct voice in `website/src/content/docs/tutorials/` and `website/src/content/docs/runbooks/`. The Tier-3 offboarding section in `skills/secrets/SKILL.md` is the compact-runbook reference: numbered steps, one-sentence explanations, single `<Aside>` for the append-only contract.
