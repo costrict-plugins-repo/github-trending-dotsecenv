@@ -1,0 +1,32 @@
+---
+title: Privacy Policy
+description: Privacy policy for the dotsecenv website and CLI tool
+---
+*Last updated: November 22, 2026*
+
+The dotsecenv CLI collects no data. This website uses Docs7 analytics to measure page views.
+
+## CLI tool
+
+The dotsecenv CLI:
+
+- **Does not phone home.** No telemetry, no update checks, no network calls of any kind. This is verified by [hermetic testing](/concepts/security-model#hermetic-testing) with network access disabled.
+- **Does not collect or transmit your secrets.** All encryption and decryption happens locally using your GPG keys.
+- **Stores data only on your filesystem.** Vault files, configuration, and keys never leave your machine unless you explicitly push them to a git remote.
+
+## Website
+
+This website (dotsecenv.com) is a static site hosted on GitHub Pages.
+
+The Docs7 analytics script sends the page URL, without its query string or fragment, and the referring site's origin to Context7. The script does not use cookies or browser storage.
+
+Docs7 derives a daily visitor identifier from the date, site, IP address and browser user agent, then stores it as a hash. [Docs7's documentation](https://context7.com/docs/docs7/analytics) states that it does not store the raw IP address.
+
+## Third-party services
+
+- **GitHub** hosts our source code and website. GitHub's own privacy policy applies when you visit our GitHub repositories. See [GitHub's Privacy Statement](https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement).
+- **Package repositories** (Homebrew, APT, YUM, Arch) are used for distribution. Each has its own privacy policy.
+
+## Contact
+
+If you have questions about this policy, open an issue on [GitHub](https://github.com/dotsecenv/dotsecenv).
